@@ -130,7 +130,7 @@ Download one main model. **Prefer the imatrix versions.**
 ./download_model.sh q2-imatrix   # 96/128 GB RAM machines, imatrix-tuned q2
 ./download_model.sh q2-q4-imatrix  # 96/128 GB RAM machines, q2 with last 6 layers q4
 ./download_model.sh q4-imatrix   # >= 256 GB RAM machines, imatrix-tuned q4
-./download_model.sh pro-imatrix  # 512 GB RAM machines, PRO imatrix quant
+./download_model.sh pro-q2-imatrix  # 512 GB RAM machines, PRO q2 imatrix quant
 ```
 
 For the full PRO Q4 distributed run, download one half on each machine:
@@ -140,20 +140,9 @@ For the full PRO Q4 distributed run, download one half on each machine:
 ./download_model.sh pro-q4-layers31-output  # second half of PRO Q4 split
 ```
 
-Legacy GGUF files are still available if you specifically need the older
-non-imatrix quants:
-
-```sh
-./download_model.sh q2           # 96/128 GB RAM machines, legacy non-imatrix
-./download_model.sh q4           # >= 256 GB RAM machines, legacy non-imatrix
-./download_model.sh pro          # 512 GB RAM machines, legacy non-imatrix PRO
-```
-
 The script downloads from `https://huggingface.co/antirez/deepseek-v4-gguf`,
 stores files under `./gguf/`, resumes partial downloads with `curl -C -`, and
-updates `./ds4flash.gguf` to point at the selected main model. The plain q2 XXS
-weights are produced with the weights importance vector only, without an
-imatrix. The imatrix variants are preferred.
+updates `./ds4flash.gguf` to point at the selected main model.
 The `pro-q4-layers00-30`, `pro-q4-layers31-output`, and `pro-q4-split` targets
 download distributed PRO Q4 pieces and do not update `./ds4flash.gguf`.
 Authentication is optional for public downloads, but `--token TOKEN`,
@@ -167,10 +156,10 @@ production currently still depends on the external `llama.cpp`-based workflow;
 native tooling can be added later.
 
 `./download_model.sh mtp` fetches the optional speculative decoding support
-GGUF for Flash. It can be used with q2-imatrix, q4-imatrix, q2, and q4, but must be
-enabled explicitly with `--mtp`. The current MTP/speculative decoding path is
-still experimental: it is correctness-gated and currently provides at most a
-slight speedup, not a meaningful generation-speed win.
+GGUF for Flash. It can be used with q2-imatrix, q2-q4-imatrix, and q4-imatrix,
+but must be enabled explicitly with `--mtp`. The current MTP/speculative
+decoding path is still experimental: it is correctness-gated and currently
+provides at most a slight speedup, not a meaningful generation-speed win.
 
 Then build:
 

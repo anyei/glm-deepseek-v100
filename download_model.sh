@@ -2,13 +2,10 @@
 set -e
 
 REPO="antirez/deepseek-v4-gguf"
-Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf"
 Q2_IMATRIX_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
-Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf"
 Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf"
 Q2_Q4_IMATRIX_FILE="DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf"
-PRO_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf"
-PRO_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
+PRO_Q2_IMATRIX_FILE="DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf"
 PRO_Q4_LAYERS00_30_FILE="DeepSeek-V4-Pro-Q4K-Layers00-30.gguf"
 PRO_Q4_LAYERS31_OUTPUT_FILE="DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf"
 MTP_FILE="DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"
@@ -29,17 +26,13 @@ Usage:
   ./download_model.sh q2-imatrix [--token TOKEN]
   ./download_model.sh q2-q4-imatrix [--token TOKEN]
   ./download_model.sh q4-imatrix [--token TOKEN]
-  ./download_model.sh q2 [--token TOKEN]
-  ./download_model.sh q4 [--token TOKEN]
-  ./download_model.sh pro [--token TOKEN]
-  ./download_model.sh pro-imatrix [--token TOKEN]
+  ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
   ./download_model.sh pro-q4-layers31-output [--token TOKEN]
   ./download_model.sh pro-q4-split [--token TOKEN]
   ./download_model.sh mtp [--token TOKEN]
 
 Targets:
-  *** PREFERRED GGUF FILES: USE THE IMATRIX VERSIONS BELOW ***
 
   q2-imatrix
        2-bit routed experts, about 81 GB on disk.
@@ -47,14 +40,16 @@ Targets:
 
   q2-q4-imatrix
        Mixed Flash quant: mostly q2 routed experts, with the last 6 layers
-       using q4 routed experts. About 98 GB on disk.
+       using q4 routed experts. About 98 GB on disk. Good for higher
+       quality inference for 128 GB MacBooks. Works on DGX Spark but loading
+       may struggle compared to q2-imatrix.
 
   q4-imatrix
        4-bit routed experts, about 153 GB on disk.
        Recommended model for machines with 256 GB RAM or more.
 
-  pro-imatrix
-       DeepSeek V4 PRO imatrix quant, as a single GGUF file. About 430 GB
+  pro-q2-imatrix
+       DeepSeek V4 PRO q2 imatrix quant, as a single GGUF file. About 430 GB
        on disk; intended for 512 GB RAM machines.
 
   pro-q4-layers00-30
@@ -70,22 +65,8 @@ Targets:
        Downloads both PRO Q4 split files into the download directory. About
        838 GB total. This target does not update ./ds4flash.gguf.
 
-  Legacy GGUF files:
-
-  q2   2-bit routed experts, about 81 GB on disk.
-       Older non-imatrix model for 96 and 128 GB RAM machines. Prefer
-       q2-imatrix unless you specifically need the legacy quant.
-
-  q4   4-bit routed experts, about 153 GB on disk.
-       Older non-imatrix model for machines with 256 GB RAM or more. Prefer
-       q4-imatrix unless you specifically need the legacy quant.
-
-  pro  DeepSeek V4 PRO non-imatrix quant, as a single GGUF file. About 430 GB
-       on disk; intended for 512 GB RAM machines. Prefer pro-imatrix unless you
-       specifically need the legacy quant.
-
   mtp  Optional speculative decoding component, about 3.5 GB on disk.
-       It is useful with q2-imatrix, q4-imatrix, q2, and q4, but must be
+       It is useful with q2-imatrix, q2-q4-imatrix, and q4-imatrix, but must be
        enabled explicitly with --mtp when running ds4 or ds4-server.
 
 Options:
@@ -105,6 +86,9 @@ Then the default commands work:
 
 After downloading mtp, enable it explicitly, for example:
   ./ds4 --mtp <download directory>/$MTP_FILE --mtp-draft 2
+
+PRO files may be too large to download via Curl, if you run
+into problems get them using the official "hf" program.
 EOF
 }
 
@@ -122,10 +106,7 @@ case "$MODEL" in
     q2-imatrix) MODEL_FILE=$Q2_IMATRIX_FILE ;;
     q2-q4-imatrix) MODEL_FILE=$Q2_Q4_IMATRIX_FILE ;;
     q4-imatrix) MODEL_FILE=$Q4_IMATRIX_FILE ;;
-    q2) MODEL_FILE=$Q2_FILE ;;
-    q4) MODEL_FILE=$Q4_FILE ;;
-    pro) MODEL_FILE=$PRO_FILE ;;
-    pro-imatrix) MODEL_FILE=$PRO_IMATRIX_FILE ;;
+    pro-q2-imatrix) MODEL_FILE=$PRO_Q2_IMATRIX_FILE ;;
     pro-q4-layers00-30) MODEL_FILE=$PRO_Q4_LAYERS00_30_FILE; LINK_MODEL=0 ;;
     pro-q4-layers31-output) MODEL_FILE=$PRO_Q4_LAYERS31_OUTPUT_FILE; LINK_MODEL=0 ;;
     pro-q4-split)
@@ -210,7 +191,7 @@ fi
 
 if [ "$MODEL" = "mtp" ]; then
     echo
-    echo "MTP is an optional component for q2-imatrix, q4-imatrix, q2, and q4."
+    echo "MTP is an optional component for q2-imatrix, q2-q4-imatrix, and q4-imatrix."
     echo "Enable it explicitly, for example:"
     echo "  ./ds4 --mtp $OUT_DIR/$MTP_FILE --mtp-draft 2"
 elif [ "$MODEL" = "pro-q4-layers00-30" ] || [ "$MODEL" = "pro-q4-layers31-output" ] || [ "$MODEL" = "pro-q4-split" ]; then
