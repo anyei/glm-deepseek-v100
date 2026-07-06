@@ -2252,20 +2252,80 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+/* Volta (sm_70) has FP16 tensor cores but no TF32, so the TF32 math mode set
+ * in ds4_gpu_init() is a no-op there and FP32 GEMMs run at the plain FMA
+ * rate. CUBLAS_COMPUTE_32F_FAST_16F makes cuBLAS down-convert FP32 inputs to
+ * FP16 (FP32 accumulate) and use the tensor cores instead: the same speed vs
+ * precision trade TF32 makes on Ampere, so it obeys the same gates (quality
+ * mode, DS4_CUDA_NO_TF32) plus its own DS4_CUDA_NO_FP16_GEMM opt-out. */
+static int g_sm_major = 0;
+
+/* Single gate for reduced-precision tensor-core math on FP32 GEMMs:
+ * TF32 math mode on Ampere+, FAST_16F compute type on major 7. */
+static int cuda_reduced_precision_gemm_allowed(void) {
+    static int env_allows = -1;
+    if (env_allows == -1) env_allows = getenv("DS4_CUDA_NO_TF32") == NULL;
+    return env_allows && !g_quality_mode;
+}
+
+static int cuda_gemm_fast16f(void) {
+    static int env_allows = -1;
+    if (env_allows == -1) env_allows = getenv("DS4_CUDA_NO_FP16_GEMM") == NULL;
+    /* major 7 covers all sm_7x (Volta and Turing): both have FP16 tensor
+     * cores and neither has TF32. */
+    return g_sm_major == 7 && env_allows && cuda_reduced_precision_gemm_allowed();
+}
+
+static cublasStatus_t cuda_sgemm(cublasOperation_t transa, cublasOperation_t transb,
+                                 int m, int n, int k,
+                                 const float *alpha, const float *A, int lda,
+                                 const float *B, int ldb,
+                                 const float *beta, float *C, int ldc) {
+    if (cuda_gemm_fast16f()) {
+        return cublasGemmEx(g_cublas, transa, transb, m, n, k, alpha,
+                            A, CUDA_R_32F, lda, B, CUDA_R_32F, ldb,
+                            beta, C, CUDA_R_32F, ldc,
+                            CUBLAS_COMPUTE_32F_FAST_16F, CUBLAS_GEMM_DEFAULT);
+    }
+    return cublasSgemm(g_cublas, transa, transb, m, n, k, alpha, A, lda,
+                       B, ldb, beta, C, ldc);
+}
+
+static cublasStatus_t cuda_sgemm_strided_batched(
+        cublasOperation_t transa, cublasOperation_t transb,
+        int m, int n, int k,
+        const float *alpha, const float *A, int lda, long long strideA,
+        const float *B, int ldb, long long strideB,
+        const float *beta, float *C, int ldc, long long strideC,
+        int batch_count) {
+    if (cuda_gemm_fast16f()) {
+        return cublasGemmStridedBatchedEx(g_cublas, transa, transb, m, n, k,
+                                          alpha, A, CUDA_R_32F, lda, strideA,
+                                          B, CUDA_R_32F, ldb, strideB,
+                                          beta, C, CUDA_R_32F, ldc, strideC,
+                                          batch_count,
+                                          CUBLAS_COMPUTE_32F_FAST_16F,
+                                          CUBLAS_GEMM_DEFAULT);
+    }
+    return cublasSgemmStridedBatched(g_cublas, transa, transb, m, n, k,
+                                     alpha, A, lda, strideA, B, ldb, strideB,
+                                     beta, C, ldc, strideC, batch_count);
+}
+
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
+        g_sm_major = prop.major;
         fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d)\n",
                 prop.name, prop.major, prop.minor);
     }
     if (!g_cublas_ready) {
         if (!cublas_ok(cublasCreate(&g_cublas), "create handle")) return 0;
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
+        const cublasMath_t math_mode = cuda_reduced_precision_gemm_allowed()
+                ? CUBLAS_TF32_TENSOR_OP_MATH
+                : CUBLAS_DEFAULT_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
         g_cublas_ready = 1;
     }
@@ -2746,10 +2806,9 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
 extern "C" void ds4_gpu_set_quality(bool quality) {
     g_quality_mode = quality ? 1 : 0;
     if (g_cublas_ready) {
-        const cublasMath_t math_mode =
-            (g_quality_mode || getenv("DS4_CUDA_NO_TF32") != NULL)
-                ? CUBLAS_DEFAULT_MATH
-                : CUBLAS_TF32_TENSOR_OP_MATH;
+        const cublasMath_t math_mode = cuda_reduced_precision_gemm_allowed()
+                ? CUBLAS_TF32_TENSOR_OP_MATH
+                : CUBLAS_DEFAULT_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
 }
@@ -7674,20 +7733,19 @@ static int cuda_matmul_q8_0_tensor_labeled(ds4_gpu_tensor *out, const void *mode
         if (w_f32) {
             const float alpha = 1.0f;
             const float beta = 0.0f;
-            cublasStatus_t st = cublasSgemm(g_cublas,
-                                            CUBLAS_OP_T,
-                                            CUBLAS_OP_N,
-                                            (int)out_dim,
-                                            (int)n_tok,
-                                            (int)in_dim,
-                                            &alpha,
-                                            w_f32,
-                                            (int)in_dim,
-                                            (const float *)x->ptr,
-                                            (int)in_dim,
-                                            &beta,
-                                            (float *)out->ptr,
-                                            (int)out_dim);
+            cublasStatus_t st = cuda_sgemm(CUBLAS_OP_T,
+                                           CUBLAS_OP_N,
+                                           (int)out_dim,
+                                           (int)n_tok,
+                                           (int)in_dim,
+                                           &alpha,
+                                           w_f32,
+                                           (int)in_dim,
+                                           (const float *)x->ptr,
+                                           (int)in_dim,
+                                           &beta,
+                                           (float *)out->ptr,
+                                           (int)out_dim);
             return cublas_ok(st, "q8 fp32 matmul");
         }
         const __half *w_f16 = cuda_q8_f16_ptr(model_map, weight_offset, weight_bytes, in_dim, out_dim, label);
@@ -8055,20 +8113,19 @@ extern "C" int ds4_gpu_matmul_f32_tensor(ds4_gpu_tensor *out, const void *model_
     if (g_cublas_ready && n_tok > 1) {
         const float alpha = 1.0f;
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemm(g_cublas,
-                                        CUBLAS_OP_T,
-                                        CUBLAS_OP_N,
-                                        (int)out_dim,
-                                        (int)n_tok,
-                                        (int)in_dim,
-                                        &alpha,
-                                        w,
-                                        (int)in_dim,
-                                        (const float *)x->ptr,
-                                        (int)in_dim,
-                                        &beta,
-                                        (float *)out->ptr,
-                                        (int)out_dim);
+        cublasStatus_t st = cuda_sgemm(CUBLAS_OP_T,
+                                       CUBLAS_OP_N,
+                                       (int)out_dim,
+                                       (int)n_tok,
+                                       (int)in_dim,
+                                       &alpha,
+                                       w,
+                                       (int)in_dim,
+                                       (const float *)x->ptr,
+                                       (int)in_dim,
+                                       &beta,
+                                       (float *)out->ptr,
+                                       (int)out_dim);
         return cublas_ok(st, "f32 matmul");
     }
     dim3 grid((unsigned)out_dim, (unsigned)n_tok, 1);
@@ -8743,47 +8800,45 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(ds4_gpu_tensor *heads,
         float *out_tmp = (float *)((char *)tmp + out_offset);
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      (const float *)raw_kv->ptr,
-                                                      (int)head_dim,
-                                                      0,
-                                                      (const float *)q->ptr,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
+        cublasStatus_t st = cuda_sgemm_strided_batched(CUBLAS_OP_T,
+                                                       CUBLAS_OP_N,
+                                                       (int)n_keys,
+                                                       (int)n_tokens,
+                                                       (int)head_dim,
+                                                       &alpha,
+                                                       (const float *)raw_kv->ptr,
+                                                       (int)head_dim,
+                                                       0,
+                                                       (const float *)q->ptr,
+                                                       (int)(n_head * head_dim),
+                                                       (long long)head_dim,
+                                                       &beta,
+                                                       scores,
+                                                       (int)n_keys,
+                                                       (long long)n_keys * n_tokens,
+                                                       (int)n_head);
         if (!cublas_ok(st, "attention raw score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_raw_softmax_kernel<<<sgrid, 256>>>(scores, sinks, n_tokens, window, n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention raw softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
-                                       CUBLAS_OP_N,
-                                       CUBLAS_OP_N,
-                                       (int)head_dim,
-                                       (int)n_tokens,
-                                       (int)n_keys,
-                                       &one,
-                                       (const float *)raw_kv->ptr,
-                                       (int)head_dim,
-                                       0,
-                                       scores,
-                                       (int)n_keys,
-                                       (long long)n_keys * n_tokens,
-                                       &beta,
-                                       out_tmp,
-                                       (int)head_dim,
-                                       (long long)head_dim * n_tokens,
-                                       (int)n_head);
+        st = cuda_sgemm_strided_batched(CUBLAS_OP_N,
+                                        CUBLAS_OP_N,
+                                        (int)head_dim,
+                                        (int)n_tokens,
+                                        (int)n_keys,
+                                        &one,
+                                        (const float *)raw_kv->ptr,
+                                        (int)head_dim,
+                                        0,
+                                        scores,
+                                        (int)n_keys,
+                                        (long long)n_keys * n_tokens,
+                                        &beta,
+                                        out_tmp,
+                                        (int)head_dim,
+                                        (long long)head_dim * n_tokens,
+                                        (int)n_head);
         if (!cublas_ok(st, "attention raw value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
@@ -9130,24 +9185,23 @@ static int attention_prefill_mixed_launch(
         if (!cuda_ok(cudaGetLastError(), "attention mixed kv pack launch")) return 0;
         const float alpha = rsqrtf((float)head_dim);
         const float beta = 0.0f;
-        cublasStatus_t st = cublasSgemmStridedBatched(g_cublas,
-                                                      CUBLAS_OP_T,
-                                                      CUBLAS_OP_N,
-                                                      (int)n_keys,
-                                                      (int)n_tokens,
-                                                      (int)head_dim,
-                                                      &alpha,
-                                                      kv,
-                                                      (int)head_dim,
-                                                      0,
-                                                      (const float *)q->ptr,
-                                                      (int)(n_head * head_dim),
-                                                      (long long)head_dim,
-                                                      &beta,
-                                                      scores,
-                                                      (int)n_keys,
-                                                      (long long)n_keys * n_tokens,
-                                                      (int)n_head);
+        cublasStatus_t st = cuda_sgemm_strided_batched(CUBLAS_OP_T,
+                                                       CUBLAS_OP_N,
+                                                       (int)n_keys,
+                                                       (int)n_tokens,
+                                                       (int)head_dim,
+                                                       &alpha,
+                                                       kv,
+                                                       (int)head_dim,
+                                                       0,
+                                                       (const float *)q->ptr,
+                                                       (int)(n_head * head_dim),
+                                                       (long long)head_dim,
+                                                       &beta,
+                                                       scores,
+                                                       (int)n_keys,
+                                                       (long long)n_keys * n_tokens,
+                                                       (int)n_head);
         if (!cublas_ok(st, "attention mixed score gemm")) return 0;
         dim3 sgrid(n_tokens, n_head, 1);
         attention_prefill_mixed_softmax_kernel<<<sgrid, 256>>>(
@@ -9162,24 +9216,23 @@ static int attention_prefill_mixed_launch(
                 n_keys);
         if (!cuda_ok(cudaGetLastError(), "attention mixed softmax launch")) return 0;
         const float one = 1.0f;
-        st = cublasSgemmStridedBatched(g_cublas,
-                                       CUBLAS_OP_N,
-                                       CUBLAS_OP_N,
-                                       (int)head_dim,
-                                       (int)n_tokens,
-                                       (int)n_keys,
-                                       &one,
-                                       kv,
-                                       (int)head_dim,
-                                       0,
-                                       scores,
-                                       (int)n_keys,
-                                       (long long)n_keys * n_tokens,
-                                       &beta,
-                                       out_tmp,
-                                       (int)head_dim,
-                                       (long long)head_dim * n_tokens,
-                                       (int)n_head);
+        st = cuda_sgemm_strided_batched(CUBLAS_OP_N,
+                                        CUBLAS_OP_N,
+                                        (int)head_dim,
+                                        (int)n_tokens,
+                                        (int)n_keys,
+                                        &one,
+                                        kv,
+                                        (int)head_dim,
+                                        0,
+                                        scores,
+                                        (int)n_keys,
+                                        (long long)n_keys * n_tokens,
+                                        &beta,
+                                        out_tmp,
+                                        (int)head_dim,
+                                        (long long)head_dim * n_tokens,
+                                        (int)n_head);
         if (!cublas_ok(st, "attention mixed value gemm")) return 0;
         uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
         attention_prefill_unpack_heads_kernel<<<(n + 255) / 256, 256>>>((float *)heads->ptr,
