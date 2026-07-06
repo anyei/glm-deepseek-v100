@@ -77,29 +77,55 @@ experts: start at 8GB and raise it while watching `nvidia-smi`; the
 non-routed weights, KV cache and scratch buffers need the rest of the
 32GB.
 
-### Using both GPUs
+### Using both GPUs (NVLink activation transport)
 
-One ds4 process drives exactly one GPU (`cudaSetDevice(0)`, no device
-flag). To use two V100s, run ds4's distributed mode: two processes
-split per-layer over TCP, each pinned to a GPU with
-`CUDA_VISIBLE_DEVICES`. Activations hop over loopback TCP (NVLink is
-not used by ds4).
+One ds4 process drives exactly one GPU. To use two V100s, run ds4's
+distributed mode: two processes split per-layer, each pinned to a GPU
+with `DS4_CUDA_DEVICE` (a local addition — unlike `CUDA_VISIBLE_DEVICES`
+it keeps both GPUs visible, which CUDA IPC requires).
+
+This tree adds a **same-host GPU IPC fast path** to the distributed
+transport: when coordinator and worker run on the same machine with the
+CUDA backend, hidden-state activations move GPU-to-GPU over NVLink/P2P
+(measured 48 GB/s, ~3 µs per decode hop on NVLink-connected V100s)
+instead of GPU → host → TCP → host → GPU. TCP still carries all control
+traffic, tokens, and results, and remains the automatic per-frame
+fallback (different hosts, oversized payloads, non-CUDA backends, or
+`DS4_DIST_NO_IPC=1`).
+
+How it works: each activation receiver allocates a small device "inbox"
+(4 slots x 1 MiB by default; `DS4_DIST_IPC_SLOTS`,
+`DS4_DIST_IPC_SLOT_BYTES`) and advertises CUDA IPC handles for it over
+TCP right after HELLO (workers) or on request (worker-to-worker forward
+connections). A sender maps the inbox once, then has its engine write
+each hidden state directly into a slot device-to-device and ships only
+an 8-byte slot descriptor in the WORK frame. Interprocess CUDA events
+per slot provide flow control. Look for
+`ds4: distributed: GPU IPC activation path enabled` in the logs.
 
 ```sh
-# GPU 0: coordinator, layers 0..30
-CUDA_VISIBLE_DEVICES=0 ./ds4 -m ds4flash.gguf --ssd-streaming \
-  --role coordinator --layers 0:30 --listen 127.0.0.1 1234
+# Same container/host; each process needs its own lock file.
+# GPU 0: coordinator, layers 0..21
+DS4_LOCK_FILE=/tmp/ds4-c.lock DS4_CUDA_DEVICE=0 ./ds4 -m ds4flash.gguf \
+  --ssd-streaming --role coordinator --layers 0:21 --listen 127.0.0.1 1234
 
-# GPU 1: worker, layers 31..output
-CUDA_VISIBLE_DEVICES=1 ./ds4 -m ds4flash.gguf --ssd-streaming \
-  --role worker --layers 31:output --coordinator 127.0.0.1 1234
+# GPU 1: worker, layers 22..output
+DS4_LOCK_FILE=/tmp/ds4-w.lock DS4_CUDA_DEVICE=1 ./ds4 -m ds4flash.gguf \
+  --ssd-streaming --role worker --layers 22:output --coordinator 127.0.0.1 1234
 ```
 
-Distributed mode mainly speeds up prefill (pipelined); decode is
-~20% slower than single-process due to per-token hops. For casual use
-the single-GPU `--ssd-streaming` recipe is simpler and well-tested
-upstream; the distributed+streaming combination is functional but not
-benchmarked upstream.
+In Docker, run both processes in one container (or give both containers
+`--ipc=host --pid=host` so CUDA IPC can cross the namespace boundary),
+with `--gpus all`.
+
+Notes and current limits:
+- Decode and the non-pipelined span path use IPC; the pipelined prefill
+  sender intentionally stays on TCP (v1).
+- The RESULT hop back to the coordinator (final hidden state or logits)
+  stays on TCP.
+- Both endpoints must run this tree's binaries; for mixed-version rings
+  set `DS4_DIST_NO_IPC=1`.
+- SSD streaming is unaffected — experts still stream from disk.
 
 ## Verifying the FP16 GEMM path
 

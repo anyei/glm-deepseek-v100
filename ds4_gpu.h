@@ -38,6 +38,46 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t count);
 
+/* =========================================================================
+ * Distributed same-host GPU IPC (CUDA only; other backends return 0/NULL).
+ *
+ * A process that receives distributed activations creates an "inbox": a
+ * device buffer of slot_count slots plus one interprocess event per slot.
+ * The peer process maps the inbox with the exported handles and copies
+ * activations device-to-device (NVLink when available) instead of sending
+ * them over TCP. The receiver records the slot's event when it consumes a
+ * slot; the sender waits on that event before reusing the slot.
+ * ========================================================================= */
+#define DS4_GPU_IPC_HANDLE_BYTES 64
+
+int ds4_gpu_dist_ipc_supported(void);
+/* CUDA device selection is per-thread; every thread that touches the GPU
+ * must bind itself to the device chosen at init (DS4_CUDA_DEVICE). No-op
+ * on other backends and on the default device. */
+void ds4_gpu_bind_thread_device(void);
+/* Returns the inbox device pointer, or NULL. Writes the memory handle to
+ * mem_handle_out (64 bytes) and slot_count event handles (64 bytes each) to
+ * event_handles_out; events_out receives slot_count opaque event objects. */
+void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes,
+                                    uint32_t slot_count,
+                                    void *mem_handle_out,
+                                    void *event_handles_out,
+                                    void **events_out);
+void ds4_gpu_dist_ipc_inbox_destroy(void *dev_ptr, void **events, uint32_t slot_count);
+void *ds4_gpu_dist_ipc_open_mem(const void *mem_handle);
+void ds4_gpu_dist_ipc_close_mem(void *mapped);
+void *ds4_gpu_dist_ipc_open_event(const void *event_handle);
+void ds4_gpu_dist_ipc_close_event(void *event);
+int ds4_gpu_dist_ipc_event_wait(void *event);
+/* Device-to-device variants of tensor_write/tensor_read used when the
+ * distributed layer redirects hidden-state I/O to IPC inbox slots.
+ * write_from_devptr records notify_event (if non-NULL) after the copy. */
+int ds4_gpu_tensor_write_from_devptr(ds4_gpu_tensor *tensor, uint64_t offset,
+                                     const void *src_dev, uint64_t bytes,
+                                     void *notify_event);
+int ds4_gpu_tensor_read_to_devptr(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                  void *dst_dev, uint64_t bytes);
+
 int ds4_gpu_begin_commands(void);
 int ds4_gpu_flush_commands(void);
 int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value);

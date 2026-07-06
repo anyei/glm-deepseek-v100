@@ -2259,6 +2259,7 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
  * precision trade TF32 makes on Ampere, so it obeys the same gates (quality
  * mode, DS4_CUDA_NO_TF32) plus its own DS4_CUDA_NO_FP16_GEMM opt-out. */
 static int g_sm_major = 0;
+static int g_cuda_device = 0;
 
 /* Single gate for reduced-precision tensor-core math on FP32 GEMMs:
  * TF32 math mode on Ampere+, FAST_16F compute type on major 7. */
@@ -2314,7 +2315,13 @@ static cublasStatus_t cuda_sgemm_strided_batched(
 
 extern "C" int ds4_gpu_init(void) {
     int dev = 0;
+    /* Distributed same-host multi-GPU runs one process per GPU with every
+     * GPU visible (CUDA IPC cannot map memory from a hidden device), so the
+     * device is selected here instead of via CUDA_VISIBLE_DEVICES. */
+    const char *dev_env = getenv("DS4_CUDA_DEVICE");
+    if (dev_env && *dev_env) dev = atoi(dev_env);
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
+    g_cuda_device = dev;
     cudaDeviceProp prop;
     if (cudaGetDeviceProperties(&prop, dev) == cudaSuccess) {
         g_sm_major = prop.major;
@@ -2508,6 +2515,135 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, con
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || !data || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
+}
+
+/* Distributed same-host GPU IPC. See ds4_gpu.h for the inbox/slot-event
+ * protocol; the copies below use cudaMemcpyDefault so unified addressing
+ * routes cross-device transfers over NVLink/P2P when the peer mapping was
+ * opened with lazy peer access. */
+extern "C" int ds4_gpu_dist_ipc_supported(void) {
+    return 1;
+}
+
+extern "C" void ds4_gpu_bind_thread_device(void) {
+    if (g_cuda_device != 0) (void)cudaSetDevice(g_cuda_device);
+}
+
+extern "C" void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes,
+                                               uint32_t slot_count,
+                                               void *mem_handle_out,
+                                               void *event_handles_out,
+                                               void **events_out) {
+    if (bytes == 0 || slot_count == 0 || !mem_handle_out || !event_handles_out ||
+        !events_out) {
+        return NULL;
+    }
+    static_assert(sizeof(cudaIpcMemHandle_t) <= DS4_GPU_IPC_HANDLE_BYTES,
+                  "IPC mem handle exceeds wire size");
+    static_assert(sizeof(cudaIpcEventHandle_t) <= DS4_GPU_IPC_HANDLE_BYTES,
+                  "IPC event handle exceeds wire size");
+    void *dev = NULL;
+    if (cudaMalloc(&dev, (size_t)bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    memset(mem_handle_out, 0, DS4_GPU_IPC_HANDLE_BYTES);
+    if (cudaIpcGetMemHandle((cudaIpcMemHandle_t *)mem_handle_out, dev) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaFree(dev);
+        return NULL;
+    }
+    memset(event_handles_out, 0, (size_t)slot_count * DS4_GPU_IPC_HANDLE_BYTES);
+    for (uint32_t i = 0; i < slot_count; i++) {
+        cudaEvent_t evt = NULL;
+        if (cudaEventCreateWithFlags(&evt, cudaEventDisableTiming |
+                                           cudaEventInterprocess) != cudaSuccess ||
+            cudaIpcGetEventHandle(
+                (cudaIpcEventHandle_t *)((char *)event_handles_out +
+                                         (size_t)i * DS4_GPU_IPC_HANDLE_BYTES),
+                evt) != cudaSuccess) {
+            (void)cudaGetLastError();
+            if (evt) (void)cudaEventDestroy(evt);
+            for (uint32_t j = 0; j < i; j++) {
+                (void)cudaEventDestroy((cudaEvent_t)events_out[j]);
+                events_out[j] = NULL;
+            }
+            (void)cudaFree(dev);
+            return NULL;
+        }
+        events_out[i] = (void *)evt;
+    }
+    return dev;
+}
+
+extern "C" void ds4_gpu_dist_ipc_inbox_destroy(void *dev_ptr, void **events,
+                                               uint32_t slot_count) {
+    if (events) {
+        for (uint32_t i = 0; i < slot_count; i++) {
+            if (events[i]) (void)cudaEventDestroy((cudaEvent_t)events[i]);
+            events[i] = NULL;
+        }
+    }
+    if (dev_ptr) (void)cudaFree(dev_ptr);
+}
+
+extern "C" void *ds4_gpu_dist_ipc_open_mem(const void *mem_handle) {
+    if (!mem_handle) return NULL;
+    void *mapped = NULL;
+    cudaIpcMemHandle_t h;
+    memcpy(&h, mem_handle, sizeof(h));
+    if (cudaIpcOpenMemHandle(&mapped, h, cudaIpcMemLazyEnablePeerAccess) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return mapped;
+}
+
+extern "C" void ds4_gpu_dist_ipc_close_mem(void *mapped) {
+    if (mapped) (void)cudaIpcCloseMemHandle(mapped);
+}
+
+extern "C" void *ds4_gpu_dist_ipc_open_event(const void *event_handle) {
+    if (!event_handle) return NULL;
+    cudaEvent_t evt = NULL;
+    cudaIpcEventHandle_t h;
+    memcpy(&h, event_handle, sizeof(h));
+    if (cudaIpcOpenEventHandle(&evt, h) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return NULL;
+    }
+    return (void *)evt;
+}
+
+extern "C" void ds4_gpu_dist_ipc_close_event(void *event) {
+    if (event) (void)cudaEventDestroy((cudaEvent_t)event);
+}
+
+extern "C" int ds4_gpu_dist_ipc_event_wait(void *event) {
+    if (!event) return 0;
+    return cuda_ok(cudaEventSynchronize((cudaEvent_t)event), "ipc slot event wait");
+}
+
+extern "C" int ds4_gpu_tensor_write_from_devptr(ds4_gpu_tensor *tensor, uint64_t offset,
+                                                const void *src_dev, uint64_t bytes,
+                                                void *notify_event) {
+    if (!tensor || !src_dev || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (!cuda_ok(cudaMemcpy((char *)tensor->ptr + offset, src_dev, (size_t)bytes,
+                            cudaMemcpyDefault), "tensor write from device")) {
+        return 0;
+    }
+    if (notify_event &&
+        !cuda_ok(cudaEventRecord((cudaEvent_t)notify_event), "ipc slot consume record")) {
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_tensor_read_to_devptr(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                             void *dst_dev, uint64_t bytes) {
+    if (!tensor || !dst_dev || offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    return cuda_ok(cudaMemcpy(dst_dev, (const char *)tensor->ptr + offset, (size_t)bytes,
+                              cudaMemcpyDefault), "tensor read to device");
 }
 
 extern "C" int ds4_gpu_tensor_read_after_selected_event(const ds4_gpu_tensor *tensor,

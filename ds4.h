@@ -280,6 +280,18 @@ const ds4_tokens *ds4_session_tokens(ds4_session *s);
 /* Low-level graph slice entry points used by distributed inference.  The
  * transport/session routing logic lives in ds4_distributed.c. */
 int ds4_session_layer_slice_reset(ds4_session *s, char *err, size_t errlen);
+/* Redirect the NEXT ds4_session_eval_layer_slice hidden-state I/O to device
+ * memory (one-shot; cleared when that eval runs). input_dev: the input
+ * activations are already in device memory (an IPC inbox slot) — skip the
+ * host upload and record input_consumed_event after copying them out.
+ * output_dev: write the produced hidden state there (a mapped peer inbox
+ * slot, device-to-device over NVLink/P2P) instead of reading back to host.
+ * Either may be NULL. Returns 1 if the backend honors the redirect, 0 if
+ * unsupported (caller must use the host/TCP path). */
+int ds4_session_layer_slice_device_io(ds4_session *s,
+                                      const void *input_dev,
+                                      void *input_consumed_event,
+                                      void *output_dev);
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,

@@ -23280,6 +23280,11 @@ struct ds4_session {
     int ctx_size;
     bool checkpoint_valid;
     bool mtp_draft_valid;
+    /* One-shot distributed IPC redirect for the next eval_layer_slice; see
+     * ds4_session_layer_slice_device_io(). */
+    const void *dist_dev_input;
+    void *dist_dev_input_evt;
+    void *dist_dev_output;
 };
 
 /* =========================================================================
@@ -26311,6 +26316,23 @@ static DS4_MAYBE_UNUSED void ds4_session_slice_commit_timeline(ds4_session *s, c
     s->mtp_draft_valid = false;
 }
 
+int ds4_session_layer_slice_device_io(ds4_session *s,
+                                      const void *input_dev,
+                                      void *input_consumed_event,
+                                      void *output_dev) {
+    if (!s) return 0;
+#ifdef DS4_NO_GPU
+    (void)input_dev; (void)input_consumed_event; (void)output_dev;
+    return 0;
+#else
+    if (!ds4_gpu_dist_ipc_supported() || ds4_session_is_cpu(s)) return 0;
+    s->dist_dev_input = input_dev;
+    s->dist_dev_input_evt = input_consumed_event;
+    s->dist_dev_output = output_dev;
+    return 1;
+#endif
+}
+
 int ds4_session_eval_layer_slice(ds4_session *s,
                                  const int *tokens,
                                  uint32_t n_tokens,
@@ -26327,12 +26349,21 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         if (errlen) snprintf(err, errlen, "missing layer-slice session");
         return 1;
     }
+    /* Consume the one-shot distributed IPC redirect up front so every
+     * return path leaves the session stash clean. */
+    const void *dev_in = s->dist_dev_input;
+    void *dev_in_evt = s->dist_dev_input_evt;
+    void *dev_out = s->dist_dev_output;
+    s->dist_dev_input = NULL;
+    s->dist_dev_input_evt = NULL;
+    s->dist_dev_output = NULL;
+    const bool has_input = input_hc != NULL || dev_in != NULL;
     if (layer_start > layer_end || layer_end >= (uint32_t)DS4_N_LAYER) {
         if (errlen) snprintf(err, errlen, "invalid layer-slice layer range %u:%u",
                              layer_start, layer_end);
         return 1;
     }
-    if (layer_start != 0 && !input_hc) {
+    if (layer_start != 0 && !has_input) {
         if (errlen) snprintf(err, errlen, "layer-slice layer %u requires input hidden-state",
                              layer_start);
         return 1;
@@ -26350,7 +26381,7 @@ int ds4_session_eval_layer_slice(ds4_session *s,
                              layer_start, layer_end);
         return 1;
     }
-    if (!input_hc && !s->engine->weights.token_embd) {
+    if (!has_input && !s->engine->weights.token_embd) {
         if (errlen) snprintf(err, errlen, "token embedding is not loaded");
         return 1;
     }
@@ -26369,6 +26400,9 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         return 1;
     }
 #ifdef DS4_NO_GPU
+    (void)dev_in;
+    (void)dev_in_evt;
+    (void)dev_out;
     if (errlen) snprintf(err, errlen, "GPU support is not compiled in");
     s->checkpoint_valid = false;
     return 1;
@@ -26381,7 +26415,8 @@ int ds4_session_eval_layer_slice(ds4_session *s,
 
     ds4_engine *e = s->engine;
     ds4_gpu_graph *g = &s->graph;
-    if (!input_hc && !output_hc && output_logits &&
+    const bool wants_hidden = output_hc != NULL || dev_out != NULL;
+    if (!has_input && !wants_hidden && output_logits &&
         layer_start == 0 && layer_end + 1u == (uint32_t)DS4_N_LAYER) {
         bool ok = false;
         ds4_tokens span = {0};
@@ -26456,15 +26491,19 @@ int ds4_session_eval_layer_slice(ds4_session *s,
         }
 
         bool ok = true;
-        if (g->ssd_streaming && !input_hc) {
+        if (g->ssd_streaming && !has_input) {
             g->streaming_static_decode_map_current = false;
             ok = metal_graph_stream_map_token(&e->model, &e->weights);
         }
-        if (input_hc) {
+        if (dev_in) {
+            ok = ds4_gpu_tensor_write_from_devptr(g->cur_hc, 0, dev_in,
+                                                  hc_dim * sizeof(float),
+                                                  dev_in_evt) != 0;
+        } else if (input_hc) {
             ok = ds4_gpu_tensor_write(g->cur_hc, 0, input_hc, hc_dim * sizeof(float)) != 0;
         }
         if (ok) ok = ds4_gpu_begin_commands() != 0;
-        if (ok && !input_hc) {
+        if (ok && !has_input) {
             ok = ds4_gpu_embed_token_hc_tensor(g->cur_hc,
                                                e->model.map,
                                                e->model.size,
@@ -26537,8 +26576,11 @@ int ds4_session_eval_layer_slice(ds4_session *s,
             }
             if (ok) ok = ds4_gpu_end_commands() != 0;
         }
-        if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
-        if (ok && output_hc) {
+        if (ok && !wants_hidden && !output_logits) ok = ds4_gpu_synchronize() != 0;
+        if (ok && dev_out) {
+            ok = ds4_gpu_tensor_read_to_devptr(g->cur_hc, 0, dev_out,
+                                               hc_dim * sizeof(float)) != 0;
+        } else if (ok && output_hc) {
             ok = ds4_gpu_tensor_read(g->cur_hc, 0, output_hc, hc_dim * sizeof(float)) != 0;
         }
         if (ok && output_logits) {
@@ -26565,12 +26607,15 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     };
 
     bool ok = true;
-    if (g->ssd_streaming && !input_hc) {
+    if (g->ssd_streaming && !has_input) {
         g->streaming_static_decode_map_current = false;
         ok = metal_graph_stream_map_token(&e->model, &e->weights);
     }
     if (ok) ok = metal_graph_upload_prompt_tokens(g->prefill_tokens, &span, 0, n_tokens);
-    if (ok && input_hc) {
+    if (ok && dev_in) {
+        ok = ds4_gpu_tensor_write_from_devptr(g->batch_cur_hc, 0, dev_in,
+                                              hc_bytes, dev_in_evt) != 0;
+    } else if (ok && input_hc) {
         ok = ds4_gpu_tensor_write(g->batch_cur_hc, 0, input_hc, hc_bytes) != 0;
     } else if (ok) {
         ok = metal_graph_upload_prompt_embeddings_hc(g->batch_cur_hc,
@@ -26637,8 +26682,10 @@ int ds4_session_eval_layer_slice(ds4_session *s,
     if (saved_cur) g->cur_hc = saved_cur;
     if (last_hc) ds4_gpu_tensor_free(last_hc);
 
-    if (ok && !output_hc && !output_logits) ok = ds4_gpu_synchronize() != 0;
-    if (ok && output_hc) {
+    if (ok && !wants_hidden && !output_logits) ok = ds4_gpu_synchronize() != 0;
+    if (ok && dev_out) {
+        ok = ds4_gpu_tensor_read_to_devptr(g->batch_cur_hc, 0, dev_out, hc_bytes) != 0;
+    } else if (ok && output_hc) {
         ok = ds4_gpu_tensor_read(g->batch_cur_hc, 0, output_hc, hc_bytes) != 0;
     }
     if (ok && output_logits) {
