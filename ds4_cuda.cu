@@ -15,6 +15,9 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -1760,6 +1763,252 @@ static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     return 1;
 }
 
+/* =========================================================================
+ * Parallel streamed expert reads.
+ *
+ * Expert misses were loaded one tensor at a time: a synchronous O_DIRECT
+ * pread followed by an H2D copy, which leaves the NVMe at queue depth 1
+ * (measured 1.25 GB/s of the ~3.5 GB/s the device can sustain). A small
+ * persistent worker pool reads independent tensors concurrently: each
+ * worker owns a pinned staging buffer and an event, preads through
+ * cuda_model_stage_read (same O_DIRECT/buffered fallback as the serial
+ * path), issues cudaMemcpyAsync on a shared upload stream, and waits on
+ * its own event before reusing the buffer. The producer blocks until the
+ * whole batch has landed, so callers keep the same "data is on the device
+ * when this returns" contract as the serial path.
+ *
+ * DS4_CUDA_STREAM_READ_THREADS overrides the worker count (0 disables the
+ * pool and restores the serial path).
+ * ========================================================================= */
+
+typedef struct cuda_stream_read_item {
+    char    *dst;      /* device destination */
+    uint64_t offset;   /* model file offset */
+    uint64_t bytes;
+} cuda_stream_read_item;
+
+static std::vector<std::thread> g_stream_read_workers;
+static std::mutex g_stream_read_mu;
+static std::condition_variable g_stream_read_work_cv;
+static std::condition_variable g_stream_read_done_cv;
+static const cuda_stream_read_item *g_stream_read_items;
+static uint32_t g_stream_read_count;
+static uint32_t g_stream_read_next;
+static uint32_t g_stream_read_pending;
+static int g_stream_read_failed;
+static int g_stream_read_shutdown;
+static const void *g_stream_read_model_map;
+static uint64_t g_stream_read_model_size;
+static cudaStream_t g_stream_read_upload_stream;
+
+static uint32_t cuda_stream_read_thread_count(void) {
+    static int cached = -1;
+    if (cached >= 0) return (uint32_t)cached;
+    long n = 8;
+    const char *env = getenv("DS4_CUDA_STREAM_READ_THREADS");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(env, &end, 10);
+        if (end != env && errno == 0 && v >= 0 && v <= 64) n = v;
+    }
+    const long hw = (long)std::thread::hardware_concurrency();
+    if (hw > 2 && n > hw - 2) n = hw - 2;
+    if (n < 0) n = 0;
+    cached = (int)n;
+    return (uint32_t)cached;
+}
+
+static void cuda_stream_read_worker(void) {
+    ds4_gpu_bind_thread_device();
+    void *raw = NULL;
+    char *buf = NULL;
+    uint64_t buf_payload_cap = 0;
+    cudaEvent_t ev = NULL;
+    for (;;) {
+        uint32_t idx;
+        {
+            std::unique_lock<std::mutex> lk(g_stream_read_mu);
+            g_stream_read_work_cv.wait(lk, [] {
+                return g_stream_read_shutdown ||
+                       (g_stream_read_items != NULL &&
+                        g_stream_read_next < g_stream_read_count);
+            });
+            if (g_stream_read_shutdown) break;
+            idx = g_stream_read_next++;
+        }
+        const cuda_stream_read_item item = g_stream_read_items[idx];
+        int ok = 1;
+
+        const uint64_t align =
+            g_model_direct_align > 1 ? g_model_direct_align : 1;
+        /* O_DIRECT reads round the span down/up to the alignment, so the
+         * staging buffer needs the rounded size plus one leading block. */
+        const uint64_t payload_need =
+            cuda_round_up(item.bytes, align) + 2ull * align;
+        if (buf_payload_cap < payload_need) {
+            if (raw) {
+                (void)cudaFreeHost(raw);
+                raw = NULL;
+                buf = NULL;
+                buf_payload_cap = 0;
+            }
+            const uint64_t alloc = payload_need + align;
+            if (cudaMallocHost(&raw, (size_t)alloc) != cudaSuccess) {
+                (void)cudaGetLastError();
+                raw = NULL;
+                ok = 0;
+            } else {
+                buf = (char *)cuda_align_ptr(raw, align);
+                buf_payload_cap = payload_need;
+            }
+        }
+        if (ok && !ev) {
+            if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) !=
+                cudaSuccess) {
+                (void)cudaGetLastError();
+                ev = NULL;
+                ok = 0;
+            }
+        }
+
+        const char *payload = NULL;
+        if (ok) {
+            ok = cuda_model_stage_read(buf,
+                                       buf_payload_cap,
+                                       item.offset,
+                                       item.bytes,
+                                       &payload);
+        }
+        if (ok) {
+            ok = cudaMemcpyAsync(item.dst,
+                                 payload,
+                                 (size_t)item.bytes,
+                                 cudaMemcpyHostToDevice,
+                                 g_stream_read_upload_stream) == cudaSuccess;
+            if (!ok) (void)cudaGetLastError();
+        }
+        if (ok) {
+            ok = cudaEventRecord(ev, g_stream_read_upload_stream) ==
+                     cudaSuccess &&
+                 cudaEventSynchronize(ev) == cudaSuccess;
+            if (!ok) (void)cudaGetLastError();
+        }
+        if (ok) {
+            cuda_model_drop_file_pages(item.offset, item.bytes);
+            cuda_model_discard_source_pages(g_stream_read_model_map,
+                                            g_stream_read_model_size,
+                                            item.offset,
+                                            item.bytes);
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(g_stream_read_mu);
+            if (!ok) g_stream_read_failed = 1;
+            if (--g_stream_read_pending == 0) {
+                g_stream_read_done_cv.notify_all();
+            }
+        }
+    }
+    if (ev) (void)cudaEventDestroy(ev);
+    if (raw) (void)cudaFreeHost(raw);
+}
+
+static void cuda_stream_read_pool_shutdown(void) {
+    {
+        std::lock_guard<std::mutex> lk(g_stream_read_mu);
+        if (g_stream_read_workers.empty()) return;
+        g_stream_read_shutdown = 1;
+    }
+    g_stream_read_work_cv.notify_all();
+    for (std::thread &t : g_stream_read_workers) t.join();
+    g_stream_read_workers.clear();
+    g_stream_read_shutdown = 0;
+    if (g_stream_read_upload_stream) {
+        (void)cudaStreamDestroy(g_stream_read_upload_stream);
+        g_stream_read_upload_stream = NULL;
+    }
+}
+
+/* Load a batch of tensors from the model file to the device. Blocks until
+ * every item is resident (or any failed). Falls back to the serial path
+ * when the pool is disabled, unavailable, or the mapping has no file fd. */
+static int cuda_stream_read_batch(
+        const void                  *model_map,
+        uint64_t                     model_size,
+        const cuda_stream_read_item *items,
+        uint32_t                     count) {
+    if (count == 0) return 1;
+    const uint32_t want_threads = cuda_stream_read_thread_count();
+    const int fd_backed =
+        g_model_fd >= 0 &&
+        !(g_model_fd_host_base != NULL && model_map != g_model_fd_host_base);
+    if (want_threads <= 1 || count == 1 || !fd_backed) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (!cuda_model_copy_to_device_streamed(items[i].dst,
+                                                    model_map,
+                                                    model_size,
+                                                    items[i].offset,
+                                                    items[i].bytes,
+                                                    "batched expert read")) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    if (!g_stream_read_upload_stream) {
+        if (cudaStreamCreateWithFlags(&g_stream_read_upload_stream,
+                                      cudaStreamNonBlocking) != cudaSuccess) {
+            (void)cudaGetLastError();
+            g_stream_read_upload_stream = NULL;
+        }
+    }
+    if (g_stream_read_upload_stream && g_stream_read_workers.empty()) {
+        try {
+            for (uint32_t i = 0; i < want_threads; i++) {
+                g_stream_read_workers.emplace_back(cuda_stream_read_worker);
+            }
+        } catch (...) {
+            cuda_stream_read_pool_shutdown();
+        }
+    }
+    if (!g_stream_read_upload_stream || g_stream_read_workers.empty()) {
+        for (uint32_t i = 0; i < count; i++) {
+            if (!cuda_model_copy_to_device_streamed(items[i].dst,
+                                                    model_map,
+                                                    model_size,
+                                                    items[i].offset,
+                                                    items[i].bytes,
+                                                    "batched expert read")) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+
+    int failed;
+    {
+        std::unique_lock<std::mutex> lk(g_stream_read_mu);
+        g_stream_read_items = items;
+        g_stream_read_count = count;
+        g_stream_read_next = 0;
+        g_stream_read_pending = count;
+        g_stream_read_failed = 0;
+        g_stream_read_model_map = model_map;
+        g_stream_read_model_size = model_size;
+        g_stream_read_work_cv.notify_all();
+        g_stream_read_done_cv.wait(lk, [] { return g_stream_read_pending == 0; });
+        g_stream_read_items = NULL;
+        failed = g_stream_read_failed;
+    }
+    if (cudaStreamSynchronize(g_stream_read_upload_stream) != cudaSuccess) {
+        (void)cudaGetLastError();
+        failed = 1;
+    }
+    return !failed;
+}
+
 static int cuda_stream_selected_ensure_bytes(
         char **ptr,
         uint64_t *capacity,
@@ -2354,6 +2603,7 @@ extern "C" void ds4_gpu_cleanup(void) {
         g_cublas_ready = 0;
         g_cublas = NULL;
     }
+    cuda_stream_read_pool_shutdown();
     cuda_stream_selected_cache_release();
     cuda_stream_expert_cache_release_all();
     cuda_stream_selected_stage_release();
@@ -3181,6 +3431,26 @@ static int cuda_stream_selected_cache_begin_compact_load(
     uint32_t cache_misses = 0;
     uint32_t direct_loads = 0;
 
+    /* Classify every compact expert up front, then load all misses in one
+     * parallel batch: hits are D2D-copied immediately, cache misses reserve
+     * an LRU slot (metadata written eagerly so later reservations in the
+     * same batch cannot pick the same victim) and batch-load into it, and
+     * direct loads batch straight into the compact buffers. */
+    std::vector<cuda_stream_read_item> load_items;
+    std::vector<uint32_t> fill_compact;   /* compact idx per cache-slot miss */
+    std::vector<uint32_t> fill_slot;      /* reserved slot per cache-slot miss */
+    std::vector<uint8_t>  fill_append;
+    std::vector<uint32_t> direct_compact; /* compact idx per direct load */
+    try {
+        load_items.reserve((size_t)compact_count * 3u);
+        fill_compact.reserve(compact_count);
+        fill_slot.reserve(compact_count);
+        fill_append.reserve(compact_count);
+        direct_compact.reserve(compact_count);
+    } catch (...) {
+        return strict_failure ? 0 : 1;
+    }
+
     for (uint32_t i = 0; i < compact_count; i++) {
         if (compact_ids[i] < 0 || (uint32_t)compact_ids[i] >= n_total_expert) {
             fprintf(stderr,
@@ -3192,12 +3462,10 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
 
         const uint64_t expert = (uint64_t)(uint32_t)compact_ids[i];
-        const uint64_t gate_dst = (uint64_t)i * gate_expert_bytes;
-        const uint64_t down_dst = (uint64_t)i * down_expert_bytes;
-        int copied_from_global_cache = 0;
+        int direct = 1;
 
         if (!expert_cache_disabled) {
-            int cache_slot =
+            const int cache_slot =
                 cuda_stream_expert_cache_find(expert_cache,
                                               model_map,
                                               model_size,
@@ -3213,76 +3481,159 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 cache_hits++;
                 expert_cache->slots[(uint32_t)cache_slot].age =
                     ++expert_cache->tick;
-            } else {
-                cache_misses++;
-                const uint32_t load_slot =
-                    cuda_stream_expert_cache_lru_slot(expert_cache);
-                const int append = !expert_cache->slots[load_slot].valid;
-                if (cuda_stream_expert_cache_load_slot(expert_cache,
-                                                       model_map,
-                                                       model_size,
-                                                       load_slot,
-                                                       layer,
-                                                       n_total_expert,
-                                                       (uint32_t)expert,
-                                                       gate_offset,
-                                                       up_offset,
-                                                       down_offset,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes)) {
-                    if (append && expert_cache->count < expert_cache->capacity) {
-                        expert_cache->count++;
-                    }
-                    cache_slot = (int)load_slot;
-                } else {
-                    cuda_stream_expert_cache_invalidate();
-                    expert_cache_disabled = 1;
-                    cache_slot = -1;
-                }
-            }
-
-            if (cache_slot >= 0) {
-                copied_from_global_cache =
-                    cuda_stream_expert_cache_copy_to_compact(
+                if (cuda_stream_expert_cache_copy_to_compact(
                             expert_cache,
                             (uint32_t)cache_slot,
                             i,
                             g_stream_selected_cache.gate_ptr,
                             g_stream_selected_cache.up_ptr,
-                            g_stream_selected_cache.down_ptr);
-                if (!copied_from_global_cache) {
+                            g_stream_selected_cache.down_ptr)) {
+                    direct = 0;
+                } else {
                     cuda_stream_expert_cache_invalidate();
                     expert_cache_disabled = 1;
                 }
+            } else if ((uint64_t)fill_compact.size() >=
+                       (uint64_t)expert_cache->capacity) {
+                /* Every slot is already reserved by this batch; a further
+                 * reservation would evict a slot whose compact mirror has
+                 * not happened yet. Load the remainder directly. */
+            } else {
+                cache_misses++;
+                const uint32_t slot =
+                    cuda_stream_expert_cache_lru_slot(expert_cache);
+                const uint8_t append =
+                    expert_cache->slots[slot].valid ? 0u : 1u;
+                cuda_stream_expert_cache_slot &entry =
+                    expert_cache->slots[slot];
+                entry.valid = 1;
+                entry.model_map = model_map;
+                entry.model_size = model_size;
+                entry.layer = layer;
+                entry.n_total_expert = n_total_expert;
+                entry.expert = (uint32_t)expert;
+                entry.gate_offset = gate_offset;
+                entry.up_offset = up_offset;
+                entry.down_offset = down_offset;
+                entry.gate_expert_bytes = gate_expert_bytes;
+                entry.down_expert_bytes = down_expert_bytes;
+                entry.age = ++expert_cache->tick;
+                fill_compact.push_back(i);
+                fill_slot.push_back(slot);
+                fill_append.push_back(append);
+                const cuda_stream_read_item gate_item = {
+                    expert_cache->gate_ptr + (uint64_t)slot * gate_expert_bytes,
+                    gate_offset + expert * gate_expert_bytes,
+                    gate_expert_bytes };
+                const cuda_stream_read_item up_item = {
+                    expert_cache->up_ptr + (uint64_t)slot * gate_expert_bytes,
+                    up_offset + expert * gate_expert_bytes,
+                    gate_expert_bytes };
+                const cuda_stream_read_item down_item = {
+                    expert_cache->down_ptr + (uint64_t)slot * down_expert_bytes,
+                    down_offset + expert * down_expert_bytes,
+                    down_expert_bytes };
+                load_items.push_back(gate_item);
+                load_items.push_back(up_item);
+                load_items.push_back(down_item);
+                direct = 0;
             }
         }
 
-        if (!copied_from_global_cache) {
-            const uint64_t gate_src = gate_offset + expert * gate_expert_bytes;
-            const uint64_t up_src = up_offset + expert * gate_expert_bytes;
-            const uint64_t down_src = down_offset + expert * down_expert_bytes;
-            direct_loads++;
-            if (!cuda_model_copy_to_device_streamed(g_stream_selected_cache.gate_ptr + gate_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    gate_src,
-                                                    gate_expert_bytes,
-                                                    "selected moe_gate") ||
-                !cuda_model_copy_to_device_streamed(g_stream_selected_cache.up_ptr + gate_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    up_src,
-                                                    gate_expert_bytes,
-                                                    "selected moe_up") ||
-                !cuda_model_copy_to_device_streamed(g_stream_selected_cache.down_ptr + down_dst,
-                                                    model_map,
-                                                    model_size,
-                                                    down_src,
-                                                    down_expert_bytes,
-                                                    "selected moe_down")) {
-                cuda_stream_selected_cache_invalidate();
-                return strict_failure ? 0 : 1;
+        if (direct) direct_compact.push_back(i);
+    }
+
+    for (uint32_t d = 0; d < direct_compact.size(); d++) {
+        const uint32_t i = direct_compact[d];
+        const uint64_t expert = (uint64_t)(uint32_t)compact_ids[i];
+        direct_loads++;
+        const cuda_stream_read_item gate_item = {
+            g_stream_selected_cache.gate_ptr + (uint64_t)i * gate_expert_bytes,
+            gate_offset + expert * gate_expert_bytes,
+            gate_expert_bytes };
+        const cuda_stream_read_item up_item = {
+            g_stream_selected_cache.up_ptr + (uint64_t)i * gate_expert_bytes,
+            up_offset + expert * gate_expert_bytes,
+            gate_expert_bytes };
+        const cuda_stream_read_item down_item = {
+            g_stream_selected_cache.down_ptr + (uint64_t)i * down_expert_bytes,
+            down_offset + expert * down_expert_bytes,
+            down_expert_bytes };
+        load_items.push_back(gate_item);
+        load_items.push_back(up_item);
+        load_items.push_back(down_item);
+    }
+
+    if (!load_items.empty() &&
+        !cuda_stream_read_batch(model_map,
+                                model_size,
+                                load_items.data(),
+                                (uint32_t)load_items.size())) {
+        /* Some slot in the global cache may hold a partial tensor now, and
+         * the compact-direct destinations are equally suspect: drop the
+         * global cache and retry every non-hit expert as a direct load. */
+        if (!expert_cache_disabled) {
+            cuda_stream_expert_cache_invalidate();
+            expert_cache_disabled = 1;
+        }
+        std::vector<cuda_stream_read_item> retry_items;
+        try {
+            retry_items.reserve((fill_compact.size() + direct_compact.size()) * 3u);
+        } catch (...) {
+            cuda_stream_selected_cache_invalidate();
+            return strict_failure ? 0 : 1;
+        }
+        for (uint32_t pass = 0; pass < 2; pass++) {
+            const std::vector<uint32_t> &idxs =
+                pass == 0 ? fill_compact : direct_compact;
+            for (uint32_t d = 0; d < idxs.size(); d++) {
+                const uint32_t i = idxs[d];
+                const uint64_t expert = (uint64_t)(uint32_t)compact_ids[i];
+                const cuda_stream_read_item gate_item = {
+                    g_stream_selected_cache.gate_ptr + (uint64_t)i * gate_expert_bytes,
+                    gate_offset + expert * gate_expert_bytes,
+                    gate_expert_bytes };
+                const cuda_stream_read_item up_item = {
+                    g_stream_selected_cache.up_ptr + (uint64_t)i * gate_expert_bytes,
+                    up_offset + expert * gate_expert_bytes,
+                    gate_expert_bytes };
+                const cuda_stream_read_item down_item = {
+                    g_stream_selected_cache.down_ptr + (uint64_t)i * down_expert_bytes,
+                    down_offset + expert * down_expert_bytes,
+                    down_expert_bytes };
+                retry_items.push_back(gate_item);
+                retry_items.push_back(up_item);
+                retry_items.push_back(down_item);
             }
+        }
+        fill_compact.clear();
+        if (!retry_items.empty() &&
+            !cuda_stream_read_batch(model_map,
+                                    model_size,
+                                    retry_items.data(),
+                                    (uint32_t)retry_items.size())) {
+            cuda_stream_selected_cache_invalidate();
+            return strict_failure ? 0 : 1;
+        }
+    }
+
+    /* Batch landed: account appended slots and mirror each filled slot into
+     * its compact position. */
+    for (uint32_t f = 0; f < fill_compact.size(); f++) {
+        if (fill_append[f] &&
+            expert_cache->count < expert_cache->capacity) {
+            expert_cache->count++;
+        }
+        if (!cuda_stream_expert_cache_copy_to_compact(
+                    expert_cache,
+                    fill_slot[f],
+                    fill_compact[f],
+                    g_stream_selected_cache.gate_ptr,
+                    g_stream_selected_cache.up_ptr,
+                    g_stream_selected_cache.down_ptr)) {
+            cuda_stream_selected_cache_invalidate();
+            cuda_stream_expert_cache_invalidate();
+            return strict_failure ? 0 : 1;
         }
     }
 

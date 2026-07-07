@@ -108,11 +108,15 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   layer's unique experts stage once per chunk instead of once per
   token — measured 0.16 -> 0.96 t/s on a 188-token prompt (6x) and
   0.16 -> 0.32 t/s at 25 tokens (2x); the advantage grows with chunk
-  size toward the 1024-token cap. Next levers, in expected value
-  order: parallelize miss reads (measured 1.25 GB/s at QD~1 vs ~3.5
-  GB/s the NVMe can do), a host pinned-RAM L2 expert cache (routing is
-  strongly skewed: a 1010-expert cache = ~5% of the pool sustains
-  34-43% hits), and async H2D overlap with compute. Host page cache
+  size toward the 1024-token cap. Expert misses now load through a
+  small reader-thread pool (8 workers, `DS4_CUDA_STREAM_READ_THREADS`,
+  0 restores the serial path): NVMe 1.25 -> 1.9 GB/s, decode 0.23 ->
+  0.35 t/s and 188-token prefill 0.99 -> 1.51 t/s (1.5x each).
+  Next levers, in expected value order: a host pinned-RAM L2 expert
+  cache (routing is strongly skewed: a 1010-expert cache = ~5% of the
+  pool sustains 34-43% hits), closing the remaining NVMe headroom
+  (~1.9 of ~3.5 GB/s — per-worker event sync against the shared upload
+  stream is the suspect), and async H2D overlap with compute. Host page cache
   does not help (measured: buffered IO + kept pages changed nothing —
   token-to-token expert reuse is too shallow for a ~6-token window).
 - The optional fast-path kernels (flash, staged KV, batched attention,
