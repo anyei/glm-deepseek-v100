@@ -116,7 +116,13 @@ Reference numbers (Q2 from local NVMe):
 | --- | --- |
 | as above | ≥ 0.35 t/s |
 | + `-e DS4_CUDA_HOST_EXPERT_CACHE_GB=28` (host L2) | ≥ 0.40 t/s |
+| + `-e DS4_CUDA_PEER_EXPERT_CACHE_GB=26` (2nd GPU, needs `NVIDIA_VISIBLE_DEVICES=0,1`; 96-token warm run) | ≥ 0.45 t/s |
 | + `-e DS4_CUDA_STREAM_READ_THREADS=0` (serial-read control) | ~0.23 t/s |
+
+The peer tier makes the host L2 redundant (0.2% residual hits) — on a
+two-GPU box prefer `PEER_EXPERT_CACHE` and leave `HOST_EXPERT_CACHE`
+off. Expect `ds4: CUDA peer expert cache: +2253 experts / 25.99 GiB on
+device 1` at startup and a combined L1 hit rate around 62% warm.
 
 With the L2 enabled, startup must print
 `ds4: CUDA pinned host expert cache: ~2422 experts / 27.99 GiB`.

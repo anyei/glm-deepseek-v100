@@ -124,8 +124,16 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   strictly worse (0.33 vs 0.40 t/s) — the GPU tier's hits are free HBM
   reads, and the dense/shared weights need no help (they fd-cache into
   VRAM on first touch; a profiler artifact that suggested otherwise is
-  documented in VALIDATION.md). Best measured decode config: 26 GB
-  expert budget + 28 GB host L2. Staging-phase attribution
+  documented in VALIDATION.md).
+  On a two-GPU box, `DS4_CUDA_PEER_EXPERT_CACHE_GB` (off by default —
+  prod deployments usually own the second GPU) extends the expert
+  cache onto the peer device: extra slots live in peer VRAM and mirror
+  into the compact buffers over NVLink. At 26 GB (+2253 experts) the
+  combined GPU tier sustains 62% hits, disk drops to ~2.7 GiB/token,
+  and warm decode reaches 0.45 t/s — and it makes the pinned-host L2
+  redundant (0.2% residual hits), so prefer peer VRAM over host RAM
+  when both are available. Best measured decode config: 26 GB expert
+  budget + 26 GB peer cache (host L2 off). Staging-phase attribution
   (`DS4_CUDA_STREAM_STAGE_TIMING=1`, exit summary) puts the decode
   token at ~2.0 s of device-bound read time (insensitive to worker
   count 8-18 and to the page-drop hints; the real device rate for the

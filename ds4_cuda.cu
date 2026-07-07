@@ -184,6 +184,16 @@ struct cuda_stream_expert_cache {
     uint64_t gate_capacity;
     uint64_t up_capacity;
     uint64_t down_capacity;
+    /* Optional extension arenas on a peer GPU: slots at index >=
+     * local_capacity live there (DS4_CUDA_PEER_EXPERT_CACHE_GB). UVA makes
+     * fills and mirror copies transparent; with peer access enabled the
+     * mirrors ride NVLink. Kernels only ever read the compact buffers, so
+     * compute never touches peer memory. */
+    uint32_t local_capacity;
+    int      peer_device;
+    char    *peer_gate_ptr;
+    char    *peer_up_ptr;
+    char    *peer_down_ptr;
     std::vector<cuda_stream_expert_cache_slot> slots;
 };
 
@@ -196,6 +206,7 @@ static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static cuda_stream_selected_cache g_stream_selected_cache;
 static cuda_stream_expert_cache g_stream_expert_cache;
+static int g_cuda_device = 0;
 static uint32_t g_stream_expert_budget_override;
 static uint32_t g_stream_expert_runtime_cap;
 static uint32_t g_stream_expert_memory_cap_notice;
@@ -1441,8 +1452,48 @@ static void cuda_stream_expert_cache_release_all(void) {
     if (g_stream_expert_cache.down_ptr) {
         (void)cudaFree(g_stream_expert_cache.down_ptr);
     }
+    /* Peer arenas were cudaMalloc'd on the peer device; UVA lets cudaFree
+     * release them from any device context. */
+    if (g_stream_expert_cache.peer_gate_ptr) {
+        (void)cudaFree(g_stream_expert_cache.peer_gate_ptr);
+    }
+    if (g_stream_expert_cache.peer_up_ptr) {
+        (void)cudaFree(g_stream_expert_cache.peer_up_ptr);
+    }
+    if (g_stream_expert_cache.peer_down_ptr) {
+        (void)cudaFree(g_stream_expert_cache.peer_down_ptr);
+    }
     g_stream_expert_cache.slots.clear();
     memset(&g_stream_expert_cache, 0, sizeof(g_stream_expert_cache));
+}
+
+/* Slot address helpers: slot indices below local_capacity address the local
+ * arenas, the rest the peer arenas. */
+static char *cuda_stream_expert_slot_gate(
+        const cuda_stream_expert_cache *cache, uint32_t slot) {
+    if (slot < cache->local_capacity || !cache->peer_gate_ptr) {
+        return cache->gate_ptr + (uint64_t)slot * cache->gate_expert_bytes;
+    }
+    return cache->peer_gate_ptr +
+           (uint64_t)(slot - cache->local_capacity) * cache->gate_expert_bytes;
+}
+
+static char *cuda_stream_expert_slot_up(
+        const cuda_stream_expert_cache *cache, uint32_t slot) {
+    if (slot < cache->local_capacity || !cache->peer_up_ptr) {
+        return cache->up_ptr + (uint64_t)slot * cache->gate_expert_bytes;
+    }
+    return cache->peer_up_ptr +
+           (uint64_t)(slot - cache->local_capacity) * cache->gate_expert_bytes;
+}
+
+static char *cuda_stream_expert_slot_down(
+        const cuda_stream_expert_cache *cache, uint32_t slot) {
+    if (slot < cache->local_capacity || !cache->peer_down_ptr) {
+        return cache->down_ptr + (uint64_t)slot * cache->down_expert_bytes;
+    }
+    return cache->peer_down_ptr +
+           (uint64_t)(slot - cache->local_capacity) * cache->down_expert_bytes;
 }
 
 static void cuda_stream_expert_cache_invalidate(void) {
@@ -1690,6 +1741,125 @@ fail:
     if (up) (void)cudaFree(up);
     if (down) (void)cudaFree(down);
     return 0;
+}
+
+/* Peer-GPU extension budget for the expert cache. Enables bidirectional
+ * peer access on first use so slot mirrors ride NVLink. Returns the slot
+ * count that fits the env budget and the peer device's free memory. */
+static uint32_t cuda_stream_expert_peer_budget_experts(
+        uint64_t expert_bytes,
+        int     *peer_device_out) {
+    *peer_device_out = -1;
+    if (expert_bytes == 0) return 0;
+    uint64_t gb = 0;
+    const char *env = getenv("DS4_CUDA_PEER_EXPERT_CACHE_GB");
+    if (env && env[0]) {
+        char *end = NULL;
+        errno = 0;
+        unsigned long long v = strtoull(env, &end, 10);
+        if (end != env && errno == 0 && v <= 1024) gb = (uint64_t)v;
+    }
+    if (gb == 0) return 0;
+
+    int ndev = 0;
+    if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev < 2) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    int peer = g_cuda_device == 0 ? 1 : 0;
+    const char *penv = getenv("DS4_CUDA_PEER_DEVICE");
+    if (penv && penv[0]) {
+        char *end = NULL;
+        long v = strtol(penv, &end, 10);
+        if (end != penv && v >= 0 && v < ndev && (int)v != g_cuda_device) {
+            peer = (int)v;
+        }
+    }
+
+    int fwd = 0, rev = 0;
+    if (cudaDeviceCanAccessPeer(&fwd, g_cuda_device, peer) != cudaSuccess ||
+        cudaDeviceCanAccessPeer(&rev, peer, g_cuda_device) != cudaSuccess ||
+        !fwd || !rev) {
+        (void)cudaGetLastError();
+        fprintf(stderr,
+                "ds4: CUDA peer expert cache disabled: no peer access %d<->%d\n",
+                g_cuda_device, peer);
+        return 0;
+    }
+    static int peer_access_enabled = 0;
+    if (!peer_access_enabled) {
+        cudaError_t err = cudaDeviceEnablePeerAccess(peer, 0);
+        if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+            (void)cudaGetLastError();
+            return 0;
+        }
+        (void)cudaGetLastError();
+        if (cudaSetDevice(peer) == cudaSuccess) {
+            err = cudaDeviceEnablePeerAccess(g_cuda_device, 0);
+            if (err != cudaSuccess &&
+                err != cudaErrorPeerAccessAlreadyEnabled) {
+                (void)cudaSetDevice(g_cuda_device);
+                (void)cudaGetLastError();
+                return 0;
+            }
+            (void)cudaGetLastError();
+        }
+        (void)cudaSetDevice(g_cuda_device);
+        peer_access_enabled = 1;
+    }
+
+    uint64_t budget = gb << 30;
+    size_t peer_free = 0, peer_total = 0;
+    if (cudaSetDevice(peer) == cudaSuccess &&
+        cudaMemGetInfo(&peer_free, &peer_total) == cudaSuccess) {
+        const uint64_t margin = 2ull << 30;
+        const uint64_t usable =
+            (uint64_t)peer_free > margin ? (uint64_t)peer_free - margin : 0;
+        if (budget > usable) budget = usable;
+    } else {
+        (void)cudaGetLastError();
+        budget = 0;
+    }
+    (void)cudaSetDevice(g_cuda_device);
+    const uint64_t slots = budget / expert_bytes;
+    *peer_device_out = peer;
+    return slots > UINT32_MAX ? UINT32_MAX : (uint32_t)slots;
+}
+
+static int cuda_stream_expert_cache_peer_alloc(
+        int peer,
+        uint32_t cap,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        char **gate_ptr,
+        char **up_ptr,
+        char **down_ptr) {
+    *gate_ptr = NULL;
+    *up_ptr = NULL;
+    *down_ptr = NULL;
+    if (cap == 0 || cudaSetDevice(peer) != cudaSuccess) {
+        (void)cudaGetLastError();
+        (void)cudaSetDevice(g_cuda_device);
+        return 0;
+    }
+    void *gate = NULL, *up = NULL, *down = NULL;
+    const uint64_t gate_bytes = (uint64_t)cap * gate_expert_bytes;
+    const uint64_t down_bytes = (uint64_t)cap * down_expert_bytes;
+    int ok = cudaMalloc(&gate, (size_t)gate_bytes) == cudaSuccess &&
+             cudaMalloc(&up, (size_t)gate_bytes) == cudaSuccess &&
+             cudaMalloc(&down, (size_t)down_bytes) == cudaSuccess;
+    if (!ok) {
+        (void)cudaGetLastError();
+        if (gate) (void)cudaFree(gate);
+        if (up) (void)cudaFree(up);
+        if (down) (void)cudaFree(down);
+    }
+    (void)cudaSetDevice(g_cuda_device);
+    if (!ok) return 0;
+    *gate_ptr = (char *)gate;
+    *up_ptr = (char *)up;
+    *down_ptr = (char *)down;
+    return 1;
 }
 
 static void cuda_stream_selected_stage_release(void) {
@@ -2394,9 +2564,12 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
 
     uint64_t reclaim_bytes = 0;
     if (same_dims &&
-        g_stream_expert_cache.capacity != 0 &&
-        (uint64_t)g_stream_expert_cache.capacity <= UINT64_MAX / expert_bytes) {
-        reclaim_bytes = (uint64_t)g_stream_expert_cache.capacity * expert_bytes;
+        g_stream_expert_cache.local_capacity != 0 &&
+        (uint64_t)g_stream_expert_cache.local_capacity <=
+            UINT64_MAX / expert_bytes) {
+        /* Only the local arenas count as reclaimable device memory. */
+        reclaim_bytes =
+            (uint64_t)g_stream_expert_cache.local_capacity * expert_bytes;
     }
     uint32_t cap =
         cuda_stream_expert_cache_live_budget(target_cap,
@@ -2456,19 +2629,55 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             continue;
         }
 
+        /* Optional peer-GPU extension: extra slots above the local
+         * capacity live on the second device and reach the compact
+         * buffers over NVLink. */
+        int peer_dev = -1;
+        uint32_t peer_cap =
+            cuda_stream_expert_peer_budget_experts(expert_bytes, &peer_dev);
+        char *peer_gate = NULL, *peer_up = NULL, *peer_down = NULL;
+        while (peer_cap >= 64) {
+            if (cuda_stream_expert_cache_peer_alloc(peer_dev,
+                                                    peer_cap,
+                                                    gate_expert_bytes,
+                                                    down_expert_bytes,
+                                                    &peer_gate,
+                                                    &peer_up,
+                                                    &peer_down)) {
+                break;
+            }
+            peer_cap /= 2;
+        }
+        if (peer_cap < 64) peer_cap = 0;
+        if (peer_cap != 0) {
+            fprintf(stderr,
+                    "ds4: CUDA peer expert cache: +%u experts / %.2f GiB on device %d\n",
+                    peer_cap,
+                    (double)((uint64_t)peer_cap * expert_bytes) / 1073741824.0,
+                    peer_dev);
+        }
+
         try {
-            g_stream_expert_cache.slots.resize(cap);
+            g_stream_expert_cache.slots.resize(cap + peer_cap);
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
             (void)cudaFree(gate_ptr);
             (void)cudaFree(up_ptr);
             (void)cudaFree(down_ptr);
+            if (peer_gate) (void)cudaFree(peer_gate);
+            if (peer_up) (void)cudaFree(peer_up);
+            if (peer_down) (void)cudaFree(peer_down);
             cuda_stream_expert_cache_release_all();
             return NULL;
         }
 
         g_stream_expert_cache.valid = 1;
-        g_stream_expert_cache.capacity = cap;
+        g_stream_expert_cache.capacity = cap + peer_cap;
+        g_stream_expert_cache.local_capacity = cap;
+        g_stream_expert_cache.peer_device = peer_dev;
+        g_stream_expert_cache.peer_gate_ptr = peer_gate;
+        g_stream_expert_cache.peer_up_ptr = peer_up;
+        g_stream_expert_cache.peer_down_ptr = peer_down;
         g_stream_expert_cache.count = 0;
         g_stream_expert_cache.tick = 0;
         g_stream_expert_cache.gate_expert_bytes = gate_expert_bytes;
@@ -2542,24 +2751,24 @@ static int cuda_stream_expert_cache_copy_to_compact(
         char *compact_gate,
         char *compact_up,
         char *compact_down) {
-    const uint64_t gate_src = (uint64_t)cache_slot * cache->gate_expert_bytes;
-    const uint64_t down_src = (uint64_t)cache_slot * cache->down_expert_bytes;
     const uint64_t gate_dst = (uint64_t)compact_slot * cache->gate_expert_bytes;
     const uint64_t down_dst = (uint64_t)compact_slot * cache->down_expert_bytes;
+    /* cudaMemcpyDefault: peer-slot sources resolve via UVA and ride NVLink
+     * once peer access is enabled. */
     return cuda_ok(cudaMemcpy(compact_gate + gate_dst,
-                              cache->gate_ptr + gate_src,
+                              cuda_stream_expert_slot_gate(cache, cache_slot),
                               (size_t)cache->gate_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
+                              cudaMemcpyDefault),
                    "streaming selected gate cache copy") &&
            cuda_ok(cudaMemcpy(compact_up + gate_dst,
-                              cache->up_ptr + gate_src,
+                              cuda_stream_expert_slot_up(cache, cache_slot),
                               (size_t)cache->gate_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
+                              cudaMemcpyDefault),
                    "streaming selected up cache copy") &&
            cuda_ok(cudaMemcpy(compact_down + down_dst,
-                              cache->down_ptr + down_src,
+                              cuda_stream_expert_slot_down(cache, cache_slot),
                               (size_t)cache->down_expert_bytes,
-                              cudaMemcpyDeviceToDevice),
+                              cudaMemcpyDefault),
                    "streaming selected down cache copy");
 }
 
@@ -2582,26 +2791,27 @@ static int cuda_stream_expert_cache_load_slot(
         up_offset + (uint64_t)expert * gate_expert_bytes;
     const uint64_t down_src =
         down_offset + (uint64_t)expert * down_expert_bytes;
-    const uint64_t gate_dst = (uint64_t)slot * gate_expert_bytes;
-    const uint64_t down_dst = (uint64_t)slot * down_expert_bytes;
-    if (!cuda_model_copy_to_device_streamed(cache->gate_ptr + gate_dst,
-                                            model_map,
-                                            model_size,
-                                            gate_src,
-                                            gate_expert_bytes,
-                                            "cached moe_gate") ||
-        !cuda_model_copy_to_device_streamed(cache->up_ptr + gate_dst,
-                                            model_map,
-                                            model_size,
-                                            up_src,
-                                            gate_expert_bytes,
-                                            "cached moe_up") ||
-        !cuda_model_copy_to_device_streamed(cache->down_ptr + down_dst,
-                                            model_map,
-                                            model_size,
-                                            down_src,
-                                            down_expert_bytes,
-                                            "cached moe_down")) {
+    if (!cuda_model_copy_to_device_streamed(
+                cuda_stream_expert_slot_gate(cache, slot),
+                model_map,
+                model_size,
+                gate_src,
+                gate_expert_bytes,
+                "cached moe_gate") ||
+        !cuda_model_copy_to_device_streamed(
+                cuda_stream_expert_slot_up(cache, slot),
+                model_map,
+                model_size,
+                up_src,
+                gate_expert_bytes,
+                "cached moe_up") ||
+        !cuda_model_copy_to_device_streamed(
+                cuda_stream_expert_slot_down(cache, slot),
+                model_map,
+                model_size,
+                down_src,
+                down_expert_bytes,
+                "cached moe_down")) {
         return 0;
     }
     cuda_stream_expert_cache_slot &entry = cache->slots[slot];
@@ -2814,7 +3024,6 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
  * precision trade TF32 makes on Ampere, so it obeys the same gates (quality
  * mode, DS4_CUDA_NO_TF32) plus its own DS4_CUDA_NO_FP16_GEMM opt-out. */
 static int g_sm_major = 0;
-static int g_cuda_device = 0;
 
 /* Single gate for reduced-precision tensor-core math on FP32 GEMMs:
  * TF32 math mode on Ampere+, FAST_16F compute type on major 7. */
@@ -3877,13 +4086,13 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 const uint64_t down_src =
                     down_offset + expert * down_expert_bytes;
                 cuda_stream_read_item gate_item = {
-                    expert_cache->gate_ptr + (uint64_t)slot * gate_expert_bytes,
+                    cuda_stream_expert_slot_gate(expert_cache, slot),
                     gate_src, gate_expert_bytes };
                 cuda_stream_read_item up_item = {
-                    expert_cache->up_ptr + (uint64_t)slot * gate_expert_bytes,
+                    cuda_stream_expert_slot_up(expert_cache, slot),
                     up_src, gate_expert_bytes };
                 cuda_stream_read_item down_item = {
-                    expert_cache->down_ptr + (uint64_t)slot * down_expert_bytes,
+                    cuda_stream_expert_slot_down(expert_cache, slot),
                     down_src, down_expert_bytes };
                 if (host_cache) {
                     const uint64_t align =
