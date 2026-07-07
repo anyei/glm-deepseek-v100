@@ -12444,6 +12444,61 @@ __global__ static void moe_down_f32_kernel(
     if (threadIdx.x == 0) down_out[(uint64_t)pair * out_dim + row] = partial[0];
 }
 
+/* Env-guarded debug tracing for the silent argument-validation failures in
+ * the generic routed MoE launcher (set DS4_GLM_DEBUG=1). */
+#define DS4_MOE_DBG(...) do { \
+    if (getenv("DS4_GLM_DEBUG")) { \
+        fprintf(stderr, "ds4-glm-debug: routed_moe_launch:%d ", __LINE__); \
+        fprintf(stderr, __VA_ARGS__); \
+        fputc('\n', stderr); \
+    } \
+} while (0)
+
+/* GLM streaming selected-expert staging (defined in ds4_cuda_glm.inc, which
+ * is included at the end of this translation unit). Under --ssd-streaming
+ * the GLM graph stages the selected experts before decode MoE calls, but its
+ * prefill paths dispatch generic-typed layers (IQ2_XXS gate/up) straight to
+ * routed_moe_launch with no host-side staging call — without on-demand
+ * staging the launcher would fall back to mapping the full multi-GiB expert
+ * tensors and fail (or OOM). These hooks only run for GLM
+ * (DS4_GLM_CUDA_EXPERIMENTAL); DeepSeek keeps its ds4.c-driven staging. */
+static int glm_cuda_stream_stage_selected(
+        const void *model_map, uint64_t model_size, uint32_t layer_index,
+        uint32_t n_total_expert, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes, const int32_t *ids, uint32_t slot_count,
+        uint32_t n_tokens);
+static int glm_cuda_stream_selected_cache_matches(
+        const void *model_map, uint32_t layer_index, uint32_t n_total_expert,
+        uint64_t required_slot_count, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes);
+static int glm_cuda_stream_staged_ids_match(
+        const void *model_map, uint32_t layer, const int32_t *ids,
+        uint32_t count);
+static void glm_cuda_stream_staged_ids_record(
+        const void *model_map, uint32_t layer, const int32_t *ids,
+        uint32_t count);
+static int glm_routed_moe_launch(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t gate_type, uint32_t up_type,
+        uint32_t down_type, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t up_expert_bytes,
+        uint64_t up_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t layer_index,
+        const ds4_gpu_tensor *x, uint32_t n_tokens, uint64_t mid_token_stride,
+        bool force_resident);
+
+static int cuda_glm_experimental_mode(void) {
+    static int cached = -1;
+    if (cached < 0) cached = getenv("DS4_GLM_CUDA_EXPERIMENTAL") != NULL ? 1 : 0;
+    return cached;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -12485,19 +12540,25 @@ static int routed_moe_launch(
         mid->bytes < (uint64_t)n_tokens * n_expert * expert_mid_dim * sizeof(float) ||
         down->bytes < (uint64_t)n_tokens * n_expert * out_dim * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
+        DS4_MOE_DBG("arg/size validation failed (n_tokens=%u n_expert=%u in=%u mid=%u out=%u)",
+                    n_tokens, n_expert, expert_in_dim, expert_mid_dim, out_dim);
         return 0;
     }
     const int q4k_path = (gate_type == 12u && down_type == 12u);
-    if (!q4k_path && (gate_type != 16u || down_type != 10u)) return 0;
+    if (!q4k_path && (gate_type != 16u || down_type != 10u)) {
+        DS4_MOE_DBG("unsupported type combo gate_type=%u down_type=%u", gate_type, down_type);
+        return 0;
+    }
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t down_bytes = (uint64_t)n_total_expert * down_expert_bytes;
     if (gate_bytes > model_size - gate_offset ||
         gate_bytes > model_size - up_offset ||
         down_bytes > model_size - down_offset) {
+        DS4_MOE_DBG("weight ranges outside model map");
         return 0;
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
-    const int use_stream_selected_cache =
+    int use_stream_selected_cache =
         !force_resident &&
         g_ssd_streaming_mode &&
         g_stream_selected_cache.valid &&
@@ -12516,6 +12577,67 @@ static int routed_moe_launch(
         g_stream_selected_cache.slot_selected_tensor.ptr &&
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
+    if (g_ssd_streaming_mode && !force_resident && cuda_glm_experimental_mode()) {
+        /* GLM: the compact cache does not remember WHICH routed ids filled
+         * its slots, and GLM prefill has no host-side staging call before
+         * this launcher — verify the staged ids against the actual routing
+         * and (re)stage on demand, exactly like glm_routed_moe_launch in
+         * ds4_cuda_glm.inc. A stale hit (same layer/params, different
+         * routing) would silently compute with the wrong experts. */
+        std::vector<int32_t> host_ids;
+        try {
+            host_ids.resize((size_t)required_slot_count);
+        } catch (...) {
+            DS4_MOE_DBG("GLM staging: host id buffer alloc failed");
+            return 0;
+        }
+        if (!ds4_gpu_tensor_read(selected,
+                                 0,
+                                 host_ids.data(),
+                                 required_slot_count * sizeof(int32_t))) {
+            DS4_MOE_DBG("GLM staging: selected readback failed");
+            return 0;
+        }
+        const int cache_ready =
+            use_stream_selected_cache &&
+            glm_cuda_stream_staged_ids_match(model_map,
+                                             layer_index,
+                                             host_ids.data(),
+                                             (uint32_t)required_slot_count);
+        if (!cache_ready) {
+            if (!glm_cuda_stream_stage_selected(model_map,
+                                                model_size,
+                                                layer_index,
+                                                n_total_expert,
+                                                gate_offset,
+                                                up_offset,
+                                                down_offset,
+                                                gate_expert_bytes,
+                                                down_expert_bytes,
+                                                host_ids.data(),
+                                                (uint32_t)required_slot_count,
+                                                n_tokens) ||
+                !glm_cuda_stream_selected_cache_matches(model_map,
+                                                        layer_index,
+                                                        n_total_expert,
+                                                        required_slot_count,
+                                                        gate_offset,
+                                                        up_offset,
+                                                        down_offset,
+                                                        gate_expert_bytes,
+                                                        down_expert_bytes)) {
+                fprintf(stderr,
+                        "ds4: CUDA GLM streaming could not stage selected experts for layer %u (generic MoE)\n",
+                        layer_index);
+                return 0;
+            }
+            glm_cuda_stream_staged_ids_record(model_map,
+                                              layer_index,
+                                              host_ids.data(),
+                                              (uint32_t)required_slot_count);
+        }
+        use_stream_selected_cache = 1;
+    }
     const ds4_gpu_tensor *selected_tensor =
         use_stream_selected_cache ? &g_stream_selected_cache.slot_selected_tensor : selected;
     const int32_t *selected_ptr = (const int32_t *)selected_tensor->ptr;
@@ -12528,7 +12650,20 @@ static int routed_moe_launch(
     const char *down_w = use_stream_selected_cache
         ? g_stream_selected_cache.down_ptr
         : cuda_model_range_ptr(model_map, down_offset, down_bytes, "moe_down");
-    if (!gate_w || !up_w || !down_w) return 0;
+    if (g_ssd_streaming_mode && !use_stream_selected_cache) {
+        DS4_MOE_DBG("streaming but selected cache MISS (force_resident=%d cache_valid=%d "
+                    "cache_layer=%u layer=%u slot_count=%u required=%llu) -> full-map fallback",
+                    (int)force_resident, g_stream_selected_cache.valid,
+                    g_stream_selected_cache.layer, layer_index,
+                    g_stream_selected_cache.slot_count,
+                    (unsigned long long)required_slot_count);
+    }
+    if (!gate_w || !up_w || !down_w) {
+        DS4_MOE_DBG("weight pointers unavailable (gate=%p up=%p down=%p stream_cache=%d)",
+                    (const void *)gate_w, (const void *)up_w, (const void *)down_w,
+                    use_stream_selected_cache);
+        return 0;
+    }
 
     int ok = 1;
     const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
@@ -13157,7 +13292,52 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
     return 1;
 }
 
+/* IQ2_XXS down-projection experts (gate/up AND down all type 16) are not
+ * supported by routed_moe_launch's kernels (its down kernels decode Q2_K
+ * only). The GLM MoE launcher's kernels are type-dispatched per block and
+ * handle IQ2_XXS for all three tensors, so under the GLM experimental CUDA
+ * port those layers delegate there (contract match: out = weighted routed
+ * sum, mid = n_tokens x n_expert x expert_mid_dim f32 scratch). GLM always
+ * calls with clamp == 0, which the GLM kernels assume; DeepSeek (env unset)
+ * keeps today's behavior. */
+static int routed_moe_delegate_glm_iq2(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *mid, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint32_t gate_type, uint32_t down_type,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t n_expert, float clamp,
+        const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens,
+        bool force_resident) {
+    if (!(cuda_glm_experimental_mode() &&
+          gate_type == 16u && down_type == 16u && clamp == 0.0f)) {
+        return -1; /* not delegated */
+    }
+    return glm_routed_moe_launch(out, mid, model_map, model_size,
+                                 gate_offset, up_offset, down_offset,
+                                 gate_type, /*up_type=*/gate_type, down_type,
+                                 gate_expert_bytes, gate_row_bytes,
+                                 /*up_expert_bytes=*/gate_expert_bytes,
+                                 /*up_row_bytes=*/gate_row_bytes,
+                                 down_expert_bytes, down_row_bytes,
+                                 expert_in_dim, expert_mid_dim, out_dim,
+                                 selected, weights, n_total_expert, n_expert,
+                                 layer_index, x, n_tokens,
+                                 (uint64_t)n_expert * expert_mid_dim,
+                                 force_resident);
+}
+
 extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, bool force_resident) {
+    const int delegated = routed_moe_delegate_glm_iq2(
+            out, mid, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert, clamp, x,
+            layer_index, 1, force_resident);
+    if (delegated >= 0) return delegated;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -13169,6 +13349,14 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
+    const int delegated = routed_moe_delegate_glm_iq2(
+            out, mid, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_type, down_type,
+            gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+            expert_in_dim, expert_mid_dim, out_dim,
+            selected, weights, n_total_expert, n_expert, clamp, x,
+            layer_index, n_tokens, false);
+    if (delegated >= 0) return delegated;
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,

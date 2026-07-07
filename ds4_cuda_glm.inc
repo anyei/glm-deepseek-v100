@@ -7,6 +7,16 @@
  * that invariant is ever broken.
  * ========================================================================= */
 
+/* Temporary-but-keepable debug tracing: every host-side argument-validation
+ * `return 0` in this file reports through this macro when DS4_GLM_DEBUG is
+ * set, so silent GPU wrapper failures can be located in one run. */
+#define DS4_GLM_DBG_RET0() do { \
+    if (getenv("DS4_GLM_DEBUG")) { \
+        fprintf(stderr, "ds4-glm-debug: %s:%d %s returned 0\n", \
+                "ds4_cuda_glm.inc", __LINE__, __func__); \
+    } \
+} while (0)
+
 static void ds4_cuda_glm_stub_note(const char *fn) {
     static int printed;
     if (!printed) {
@@ -33,6 +43,7 @@ static void ds4_cuda_glm_stub_note(const char *fn) {
 #define GLM_CUDA_TENSOR_Q4_K 12u
 #define GLM_CUDA_TENSOR_Q5_K 13u
 #define GLM_CUDA_TENSOR_Q6_K 14u
+#define GLM_CUDA_TENSOR_IQ2_XXS 16u
 
 /* Upper bound on n_expert_used the router kernel can select (GLM-5.2 uses 8;
  * DS4_MAX_EXPERT_USED is 8 as well — 32 leaves headroom). */
@@ -146,6 +157,38 @@ __device__ static float dev_q6_K_dot_f32(const cuda_block_q6_K *row, const float
     return acc;
 }
 
+/* IQ2_XXS single-block dot against f32 activations. Faithful port of
+ * ds4_vec_dot_iq2_xxs_f32 (ds4.c) for one CUDA_QK_K-wide block, using the
+ * constant cuda_iq2xxs_grid / cuda_ksigns_iq2xs tables (ds4_iq2_tables
+ * _cuda.inc): value_j = grid_byte_j * (ksigns & (1<<j) ? -1 : +1), scale =
+ * 0.125 * d * (2*(aux1>>28) + 1) per 32-wide group. */
+__device__ static float dev_iq2_xxs_dot_block_f32(
+        const cuda_block_iq2_xxs *xb,
+        const float *y) {
+    const float d = dev_f16_to_f32(xb->d);
+    const uint16_t *q2 = xb->qs;
+    float sumf = 0.0f;
+    for (uint32_t ib32 = 0; ib32 < CUDA_QK_K / 32u; ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const float scale = 0.125f * d * (float)(2u * (aux1 >> 28) + 1u);
+        const float *yb = y + ib32 * 32u;
+        float acc = 0.0f;
+        for (uint32_t l = 0; l < 4u; l++) {
+            const uint64_t grid = cuda_iq2xxs_grid[(aux0 >> (8u * l)) & 0xffu];
+            const uint32_t signs = cuda_ksigns_iq2xs[(aux1 >> (7u * l)) & 127u];
+            const float *yf = yb + l * 8u;
+            for (uint32_t j = 0; j < 8u; j++) {
+                const float g = (float)(uint32_t)((grid >> (8u * j)) & 0xffu);
+                acc += (signs & (1u << j)) ? -g * yf[j] : g * yf[j];
+            }
+        }
+        sumf += scale * acc;
+    }
+    return sumf;
+}
+
 /* Dot of one CUDA_QK_K-wide block `b` of a quantized weight row against the
  * matching f32 activation slice. `type` is uniform across a thread block. */
 __device__ __forceinline__ static float glm_dev_expert_dot_block_f32(
@@ -155,6 +198,8 @@ __device__ __forceinline__ static float glm_dev_expert_dot_block_f32(
         const float *x) {
     const float *xb = x + (uint64_t)b * CUDA_QK_K;
     switch (type) {
+    case GLM_CUDA_TENSOR_IQ2_XXS:
+        return dev_iq2_xxs_dot_block_f32((const cuda_block_iq2_xxs *)row_base + b, xb);
     case GLM_CUDA_TENSOR_Q2_K:
         return dev_q2_K_dot_f32((const cuda_block_q2_K *)row_base + b, xb, 1);
     case GLM_CUDA_TENSOR_Q4_K:
@@ -245,12 +290,12 @@ static int glm_router_select_launch(
         probs->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert_used * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t bias_bytes = (uint64_t)n_expert * sizeof(float);
-    if (bias_offset > model_size || model_size - bias_offset < bias_bytes) return 0;
+    if (bias_offset > model_size || model_size - bias_offset < bias_bytes) { DS4_GLM_DBG_RET0(); return 0; }
     const float *bias = (const float *)cuda_model_range_ptr(model_map, bias_offset, bias_bytes, "glm_router_bias");
-    if (!bias) return 0;
+    if (!bias) { DS4_GLM_DBG_RET0(); return 0; }
     const uint32_t shared_bytes = (uint32_t)(n_expert * sizeof(float));
     glm_router_select_kernel<<<n_tokens, 256, shared_bytes>>>(
             (int32_t *)selected->ptr,
@@ -372,27 +417,30 @@ __global__ static void glm_moe_down_out_f32_kernel(
 
 static bool glm_cuda_gate_pair_type_supported(uint32_t gate_type, uint32_t up_type) {
     return gate_type == up_type &&
-           (gate_type == GLM_CUDA_TENSOR_Q2_K ||
+           (gate_type == GLM_CUDA_TENSOR_IQ2_XXS ||
+            gate_type == GLM_CUDA_TENSOR_Q2_K ||
             gate_type == GLM_CUDA_TENSOR_Q4_K ||
             gate_type == GLM_CUDA_TENSOR_Q5_K);
 }
 
 static bool glm_cuda_down_type_supported(uint32_t down_type) {
-    return down_type == GLM_CUDA_TENSOR_Q2_K ||
+    return down_type == GLM_CUDA_TENSOR_IQ2_XXS ||
+           down_type == GLM_CUDA_TENSOR_Q2_K ||
            down_type == GLM_CUDA_TENSOR_Q4_K ||
            down_type == GLM_CUDA_TENSOR_Q5_K ||
            down_type == GLM_CUDA_TENSOR_Q6_K;
 }
 
-/* Dense K-quant row bytes for expert_in-wide rows; 0 when unsupported. */
+/* Dense quantized row bytes for expert_in-wide rows; 0 when unsupported. */
 static uint64_t glm_cuda_row_bytes_for_type(uint32_t type, uint32_t in_dim) {
     const uint64_t nb = in_dim / CUDA_QK_K;
     switch (type) {
+    case GLM_CUDA_TENSOR_IQ2_XXS: return nb * sizeof(cuda_block_iq2_xxs);
     case GLM_CUDA_TENSOR_Q2_K: return nb * sizeof(cuda_block_q2_K);
     case GLM_CUDA_TENSOR_Q4_K: return nb * sizeof(cuda_block_q4_K);
     case GLM_CUDA_TENSOR_Q5_K: return nb * sizeof(cuda_block_q5_K);
     case GLM_CUDA_TENSOR_Q6_K: return nb * sizeof(cuda_block_q6_K);
-    default: return 0;
+    default: { DS4_GLM_DBG_RET0(); return 0; }
     }
 }
 
@@ -507,7 +555,7 @@ static int glm_cuda_stream_stage_selected(
         const int32_t *ids,
         uint32_t       slot_count,
         uint32_t       n_tokens) {
-    if (!ids || slot_count == 0 || n_total_expert == 0) return 0;
+    if (!ids || slot_count == 0 || n_total_expert == 0) { DS4_GLM_DBG_RET0(); return 0; }
     std::vector<int32_t> expert_to_slot;
     std::vector<int32_t> compact_ids;
     std::vector<int32_t> slot_ids;
@@ -517,7 +565,7 @@ static int glm_cuda_stream_stage_selected(
         compact_ids.reserve(slot_count < n_total_expert ? slot_count
                                                         : n_total_expert);
     } catch (...) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert_i = ids[i];
@@ -594,7 +642,7 @@ static int glm_routed_moe_launch(
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
         !glm_cuda_gate_pair_type_supported(gate_type, up_type) ||
         !glm_cuda_down_type_supported(down_type)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     if (gate_row_bytes != glm_cuda_row_bytes_for_type(gate_type, expert_in_dim) ||
         up_row_bytes != glm_cuda_row_bytes_for_type(up_type, expert_in_dim) ||
@@ -602,16 +650,16 @@ static int glm_routed_moe_launch(
         gate_expert_bytes != (uint64_t)expert_mid_dim * gate_row_bytes ||
         up_expert_bytes != (uint64_t)expert_mid_dim * up_row_bytes ||
         down_expert_bytes != (uint64_t)out_dim * down_row_bytes) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
-    if (mid_token_stride < (uint64_t)n_expert * expert_mid_dim) return 0;
+    if (mid_token_stride < (uint64_t)n_expert * expert_mid_dim) { DS4_GLM_DBG_RET0(); return 0; }
     if (x->bytes < (uint64_t)n_tokens * expert_in_dim * sizeof(float) ||
         selected->bytes < (uint64_t)n_tokens * n_expert * sizeof(int32_t) ||
         weights->bytes < (uint64_t)n_tokens * n_expert * sizeof(float) ||
         mid->bytes < ((uint64_t)(n_tokens - 1u) * mid_token_stride +
                       (uint64_t)n_expert * expert_mid_dim) * sizeof(float) ||
         out->bytes < (uint64_t)n_tokens * out_dim * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t gate_bytes = (uint64_t)n_total_expert * gate_expert_bytes;
     const uint64_t up_bytes = (uint64_t)n_total_expert * up_expert_bytes;
@@ -619,10 +667,10 @@ static int glm_routed_moe_launch(
     if (gate_offset > model_size || gate_bytes > model_size - gate_offset ||
         up_offset > model_size || up_bytes > model_size - up_offset ||
         down_offset > model_size || down_bytes > model_size - down_offset) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     /* grid.y limits: pairs for the mid kernel, tokens for the down kernel. */
-    if ((uint64_t)n_tokens * n_expert > 65535u) return 0;
+    if ((uint64_t)n_tokens * n_expert > 65535u) { DS4_GLM_DBG_RET0(); return 0; }
 
     /* Weight addressing.
      *
@@ -647,19 +695,19 @@ static int glm_routed_moe_launch(
          * forces gate_expert_bytes == up_expert_bytes (gate_type ==
          * up_type, same dims), so this cannot trigger — keep it as a
          * guard. */
-        if (gate_expert_bytes != up_expert_bytes) return 0;
+        if (gate_expert_bytes != up_expert_bytes) { DS4_GLM_DBG_RET0(); return 0; }
         const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
         std::vector<int32_t> host_ids;
         try {
             host_ids.resize((size_t)required_slot_count);
         } catch (...) {
-            return 0;
+            { DS4_GLM_DBG_RET0(); return 0; }
         }
         if (!ds4_gpu_tensor_read(selected,
                                  0,
                                  host_ids.data(),
                                  required_slot_count * sizeof(int32_t))) {
-            return 0;
+            { DS4_GLM_DBG_RET0(); return 0; }
         }
         const int cache_ready =
             glm_cuda_stream_selected_cache_matches(model_map,
@@ -700,7 +748,7 @@ static int glm_routed_moe_launch(
                 fprintf(stderr,
                         "ds4: CUDA GLM streaming could not stage selected experts for layer %u\n",
                         layer_index);
-                return 0;
+                { DS4_GLM_DBG_RET0(); return 0; }
             }
             glm_cuda_stream_staged_ids_record(model_map,
                                               layer_index,
@@ -718,7 +766,7 @@ static int glm_routed_moe_launch(
         up_w = cuda_model_range_ptr(model_map, up_offset, up_bytes, "glm_moe_up");
         down_w = cuda_model_range_ptr(model_map, down_offset, down_bytes, "glm_moe_down");
     }
-    if (!gate_w || !up_w || !down_w || !selected_ids) return 0;
+    if (!gate_w || !up_w || !down_w || !selected_ids) { DS4_GLM_DBG_RET0(); return 0; }
 
     dim3 mgrid(expert_mid_dim, n_tokens * n_expert, 1);
     glm_moe_gate_up_mid_f32_kernel<<<mgrid, 256>>>(
@@ -1000,7 +1048,7 @@ static int glm_rope_offset_launch(
         rot_dim == 0 || (rot_dim & 1u) != 0 ||
         rot_offset > head_dim || rot_dim > head_dim - rot_offset ||
         x->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint32_t pairs = n_tokens * n_head * (rot_dim / 2);
     glm_rope_offset_kernel<<<(pairs + 255) / 256, 256>>>(
@@ -1138,7 +1186,7 @@ static int glm_cuda_ensure_dyn_shmem(const void *kernel_func, uint64_t shmem) {
                                      cudaDevAttrMaxSharedMemoryPerBlockOptin,
                                      dev);
     }
-    if (err != cudaSuccess || (uint64_t)max_optin < shmem) return 0;
+    if (err != cudaSuccess || (uint64_t)max_optin < shmem) { DS4_GLM_DBG_RET0(); return 0; }
     err = cudaFuncSetAttribute(kernel_func,
                                cudaFuncAttributeMaxDynamicSharedMemorySize,
                                (int)shmem);
@@ -1813,7 +1861,7 @@ extern "C" int ds4_gpu_add3_tensor(
         out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
         b->bytes < (uint64_t)n * sizeof(float) ||
-        c->bytes < (uint64_t)n * sizeof(float)) return 0;
+        c->bytes < (uint64_t)n * sizeof(float)) { DS4_GLM_DBG_RET0(); return 0; }
     glm_add3_kernel<<<(n + 255) / 256, 256>>>(
             (float *)out->ptr,
             (const float *)a->ptr,
@@ -1837,11 +1885,11 @@ extern "C" int ds4_gpu_add_rms_norm_weight_tensor(
         norm_out->bytes < (uint64_t)n * sizeof(float) ||
         sum_out->bytes < (uint64_t)n * sizeof(float) ||
         a->bytes < (uint64_t)n * sizeof(float) ||
-        b->bytes < (uint64_t)n * sizeof(float)) return 0;
+        b->bytes < (uint64_t)n * sizeof(float)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t w_bytes = (uint64_t)n * sizeof(float);
-    if (weight_offset > model_size || w_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || w_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "glm_add_rms_weight");
-    if (!wptr) return 0;
+    if (!wptr) { DS4_GLM_DBG_RET0(); return 0; }
     glm_add_rms_norm_weight_kernel<<<1, 256>>>(
             (float *)norm_out->ptr,
             (float *)sum_out->ptr,
@@ -1862,13 +1910,13 @@ extern "C" int ds4_gpu_embed_token_q8_0_tensor(
         uint32_t          token,
         uint32_t          n_embd) {
     if (!out || !model_map || n_vocab == 0 || n_embd == 0 || token >= n_vocab ||
-        out->bytes < (uint64_t)n_embd * sizeof(float)) return 0;
+        out->bytes < (uint64_t)n_embd * sizeof(float)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t row_blocks = ((uint64_t)n_embd + 31u) / 32u;
     const uint64_t row_bytes = row_blocks * 34u;
     const uint64_t table_bytes = (uint64_t)n_vocab * row_bytes;
-    if (weight_offset > model_size || table_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || table_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *w = cuda_model_range_ptr(model_map, weight_offset, table_bytes, "glm_embed_q8_0");
-    if (!w) return 0;
+    if (!w) { DS4_GLM_DBG_RET0(); return 0; }
     const unsigned char *row = (const unsigned char *)w + (uint64_t)token * row_bytes;
     dequant_q8_0_to_f32_kernel<<<(n_embd + 255) / 256, 256>>>(
             (float *)out->ptr,
@@ -1890,13 +1938,13 @@ extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
         uint32_t                n_embd) {
     if (!out || !tokens || !model_map || n_vocab == 0 || n_tokens == 0 || n_embd == 0 ||
         out->bytes < (uint64_t)n_tokens * n_embd * sizeof(float) ||
-        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) return 0;
+        tokens->bytes < (uint64_t)n_tokens * sizeof(int32_t)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t row_blocks = ((uint64_t)n_embd + 31u) / 32u;
     const uint64_t row_bytes = row_blocks * 34u;
     const uint64_t table_bytes = (uint64_t)n_vocab * row_bytes;
-    if (weight_offset > model_size || table_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || table_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *w = cuda_model_range_ptr(model_map, weight_offset, table_bytes, "glm_embed_q8_0");
-    if (!w) return 0;
+    if (!w) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t n = (uint64_t)n_tokens * n_embd;
     glm_embed_tokens_q8_0_kernel<<<(unsigned)((n + 255) / 256), 256>>>(
             (float *)out->ptr,
@@ -1930,7 +1978,7 @@ extern "C" int ds4_gpu_glm_attention_flash_staged_tensor(
         uint32_t              value_dim,
         bool                  cache_f16) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_flash_staged_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_attention_flash_tensor(
@@ -1947,7 +1995,7 @@ extern "C" int ds4_gpu_glm_attention_flash_tensor(
         uint32_t              value_dim,
         bool                  cache_f16) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_flash_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_attention_full_tensor(
@@ -1974,7 +2022,7 @@ extern "C" int ds4_gpu_glm_attention_full_tensor(
         heads->bytes < (uint64_t)n_tokens * n_head * value_dim * sizeof(float) ||
         key_cache->bytes < (uint64_t)cache_len * n_head * qk_dim * esize ||
         value_cache->bytes < (uint64_t)cache_len * n_head * value_dim * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     /* Scale computed like the CPU reference / Metal host: 1/sqrt(qk_dim). */
     const float scale = 1.0f / sqrtf((float)qk_dim);
@@ -2022,7 +2070,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
         float                 beta_fast,
         float                 beta_slow) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
@@ -2048,7 +2096,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
         float                 beta_fast,
         float                 beta_slow) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
@@ -2078,7 +2126,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
         float                 beta_fast,
         float                 beta_slow) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
@@ -2119,17 +2167,17 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
         selected->bytes < (uint64_t)n_selected * sizeof(uint32_t) ||
         kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * esize ||
         k_rope_cache->bytes < (uint64_t)cache_cap * qk_rope * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t value_row_bytes = glm_cuda_q8_row_bytes(kv_lora_dim);
     const uint64_t weight_bytes = (uint64_t)n_head * value_dim * value_row_bytes;
     if (value_weight_offset > model_size ||
         weight_bytes > model_size - value_weight_offset) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const char *v_w = cuda_model_range_ptr(model_map, value_weight_offset,
                                            weight_bytes, "glm_attn_v_b");
-    if (!v_w) return 0;
+    if (!v_w) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t shmem =
         ((uint64_t)n_selected + 2u * kv_lora_dim + qk_rope + 256u) * sizeof(float);
     /* scores(2048) + lora_sum(512) + low(512) + q_rope(64) + red(256) =
@@ -2139,12 +2187,12 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
     if (cache_f16) {
         if (!glm_cuda_ensure_dyn_shmem(
                     (const void *)glm_attention_indexed_decode_kernel<true>, shmem)) {
-            return 0;
+            { DS4_GLM_DBG_RET0(); return 0; }
         }
     } else {
         if (!glm_cuda_ensure_dyn_shmem(
                     (const void *)glm_attention_indexed_decode_kernel<false>, shmem)) {
-            return 0;
+            { DS4_GLM_DBG_RET0(); return 0; }
         }
     }
     /* Scale computed like the CPU reference / Metal host: 1/sqrt(qk_dim). */
@@ -2223,7 +2271,7 @@ extern "C" int ds4_gpu_glm_attention_indexed_decode_split_group8_tensor(
     (void)freq_scale; (void)ext_factor; (void)attn_factor; (void)beta_fast;
     (void)beta_slow;
     ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_decode_split_group8_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_build_kv_cache_flash_tensor(
@@ -2250,7 +2298,7 @@ extern "C" int ds4_gpu_glm_build_kv_cache_flash_tensor(
         float                 beta_slow,
         bool                  cache_f16) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_build_kv_cache_flash_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_build_kv_cache_tensor(
@@ -2288,7 +2336,7 @@ extern "C" int ds4_gpu_glm_build_kv_cache_tensor(
         value->bytes < (uint64_t)n_tokens * n_head * value_dim * sizeof(float) ||
         key_cache->bytes < (uint64_t)cache_cap * n_head * qk_dim * esize ||
         value_cache->bytes < (uint64_t)cache_cap * n_head * value_dim * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     dim3 grid(n_tokens, n_head, 1);
     if (cache_f16) {
@@ -2324,7 +2372,7 @@ extern "C" int ds4_gpu_glm_fill_selected_range_batch_tensor(
         uint32_t        n_selected,
         uint32_t        pad_row) {
     if (!selected || n_tokens == 0 || n_selected == 0 ||
-        selected->bytes < (uint64_t)n_tokens * n_selected * sizeof(uint32_t)) return 0;
+        selected->bytes < (uint64_t)n_tokens * n_selected * sizeof(uint32_t)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint32_t total = n_tokens * n_selected;
     glm_fill_selected_range_batch_kernel<<<(total + 255) / 256, 256>>>(
             (uint32_t *)selected->ptr,
@@ -2339,7 +2387,7 @@ extern "C" int ds4_gpu_glm_fill_selected_range_tensor(
         ds4_gpu_tensor *selected,
         uint32_t        n_selected) {
     if (!selected || n_selected == 0 ||
-        selected->bytes < (uint64_t)n_selected * sizeof(uint32_t)) return 0;
+        selected->bytes < (uint64_t)n_selected * sizeof(uint32_t)) { DS4_GLM_DBG_RET0(); return 0; }
     glm_fill_selected_range_kernel<<<(n_selected + 255) / 256, 256>>>(
             (uint32_t *)selected->ptr,
             n_selected);
@@ -2385,10 +2433,10 @@ extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
         q->bytes < (uint64_t)n_head * head_dim * sizeof(float) ||
         weights->bytes < (uint64_t)n_head * sizeof(float) ||
         indexer_key_cache->bytes < (uint64_t)n_rows * head_dim * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t shmem = (uint64_t)head_dim * sizeof(float);
-    if (shmem > 48u * 1024u) return 0;
+    if (shmem > 48u * 1024u) { DS4_GLM_DBG_RET0(); return 0; }
     if (cache_f16) {
         glm_indexer_score_one_kernel<true><<<n_rows, 256, (size_t)shmem>>>(
                 (float *)scores->ptr,
@@ -2427,10 +2475,10 @@ extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
         q->bytes < (uint64_t)n_tokens * n_head * head_dim * sizeof(float) ||
         weights->bytes < (uint64_t)n_tokens * n_head * sizeof(float) ||
         indexer_key_cache->bytes < (uint64_t)n_rows * head_dim * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t shmem = (uint64_t)head_dim * sizeof(float);
-    if (shmem > 48u * 1024u) return 0;
+    if (shmem > 48u * 1024u) { DS4_GLM_DBG_RET0(); return 0; }
     dim3 grid(n_rows, n_tokens, 1);
     if (cache_f16) {
         glm_indexer_scores_batch_kernel<true><<<grid, 256, (size_t)shmem>>>(
@@ -2465,17 +2513,17 @@ extern "C" int ds4_gpu_glm_k_b_project_tensor(
         n_head > 65535u ||
         out->bytes < (uint64_t)n_tokens * n_head * qk_nope * sizeof(float) ||
         kv_norm->bytes < (uint64_t)n_tokens * kv_lora_dim * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint32_t threads = ((qk_nope + 31u) / 32u) * 32u;
     const uint64_t shmem = (uint64_t)kv_lora_dim * sizeof(float);
-    if (threads > 1024u || shmem > 48u * 1024u) return 0;
+    if (threads > 1024u || shmem > 48u * 1024u) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t row_bytes = glm_cuda_q8_row_bytes(qk_nope);
     const uint64_t weight_bytes = (uint64_t)n_head * kv_lora_dim * row_bytes;
-    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *w = cuda_model_range_ptr(model_map, weight_offset,
                                          weight_bytes, "glm_attn_k_b");
-    if (!w) return 0;
+    if (!w) { DS4_GLM_DBG_RET0(); return 0; }
     dim3 grid(n_tokens, n_head, 1);
     glm_k_b_project_q8_0_kernel<<<grid, threads, (size_t)shmem>>>(
             (float *)out->ptr,
@@ -2498,11 +2546,11 @@ extern "C" int ds4_gpu_glm_kv_lora_rms_norm_tensor(
     if (!out || !kv_raw || !model_map || n_tokens == 0 ||
         kv_lora_dim == 0 || kv_lora_dim > kv_raw_dim ||
         out->bytes < (uint64_t)n_tokens * kv_lora_dim * sizeof(float) ||
-        kv_raw->bytes < (uint64_t)n_tokens * kv_raw_dim * sizeof(float)) return 0;
+        kv_raw->bytes < (uint64_t)n_tokens * kv_raw_dim * sizeof(float)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t w_bytes = (uint64_t)kv_lora_dim * sizeof(float);
-    if (weight_offset > model_size || w_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || w_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *wptr = cuda_model_range_ptr(model_map, weight_offset, w_bytes, "glm_kv_lora_rms_weight");
-    if (!wptr) return 0;
+    if (!wptr) { DS4_GLM_DBG_RET0(); return 0; }
     glm_kv_lora_rms_norm_kernel<<<n_tokens, 256>>>(
             (float *)out->ptr,
             (const float *)kv_raw->ptr,
@@ -2526,7 +2574,7 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
         uint32_t              qk_nope,
         uint32_t              qk_dim) {
     ds4_cuda_glm_stub_note("ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor");
-    return 0;
+    { DS4_GLM_DBG_RET0(); return 0; }
 }
 
 extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
@@ -2544,16 +2592,16 @@ extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
         qk_nope > qk_dim ||
         qk_low->bytes < (uint64_t)n_head * kv_lora_dim * sizeof(float) ||
         q->bytes < (uint64_t)n_head * qk_dim * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t shmem = (uint64_t)qk_nope * sizeof(float);
-    if (shmem > 48u * 1024u) return 0;
+    if (shmem > 48u * 1024u) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t row_bytes = glm_cuda_q8_row_bytes(qk_nope);
     const uint64_t weight_bytes = (uint64_t)n_head * kv_lora_dim * row_bytes;
-    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *w = cuda_model_range_ptr(model_map, weight_offset,
                                          weight_bytes, "glm_attn_k_b");
-    if (!w) return 0;
+    if (!w) { DS4_GLM_DBG_RET0(); return 0; }
     glm_qk_lowrank_q8_0_kernel<<<n_head, 256, (size_t)shmem>>>(
             (float *)qk_low->ptr,
             w,
@@ -2591,17 +2639,17 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
         kv_raw->bytes < (uint64_t)n_tokens * kv_raw_dim * sizeof(float) ||
         kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * esize ||
         k_rope_cache->bytes < (uint64_t)cache_cap * qk_rope * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t q_w_bytes = (uint64_t)q_n * sizeof(float);
     const uint64_t kv_w_bytes = (uint64_t)kv_lora_dim * sizeof(float);
-    if (q_weight_offset > model_size || q_w_bytes > model_size - q_weight_offset) return 0;
-    if (kv_weight_offset > model_size || kv_w_bytes > model_size - kv_weight_offset) return 0;
+    if (q_weight_offset > model_size || q_w_bytes > model_size - q_weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
+    if (kv_weight_offset > model_size || kv_w_bytes > model_size - kv_weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const float *q_w = (const float *)cuda_model_range_ptr(model_map, q_weight_offset,
                                                            q_w_bytes, "glm_q_a_norm");
     const float *kv_w = (const float *)cuda_model_range_ptr(model_map, kv_weight_offset,
                                                             kv_w_bytes, "glm_kv_a_norm");
-    if (!q_w || !kv_w) return 0;
+    if (!q_w || !kv_w) { DS4_GLM_DBG_RET0(); return 0; }
 
     /* p0: plain RMS norm of q (row width q_n) — reuse the kv_lora norm
      * kernel with raw_dim == lora_dim == q_n. */
@@ -2610,7 +2658,7 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
             (const float *)q->ptr,
             q_w,
             n_tokens, q_n, q_n, eps);
-    if (!cuda_ok(cudaGetLastError(), "glm qkv_norm_store q-norm launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "glm qkv_norm_store q-norm launch")) { DS4_GLM_DBG_RET0(); return 0; }
 
     /* p1: RMS norm kv_raw[0..kv_lora_dim) into kv_lora_cache[pos]. */
     if (cache_f16) {
@@ -2626,7 +2674,7 @@ extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
                 kv_w,
                 pos0, n_tokens, cache_cap, kv_raw_dim, kv_lora_dim, eps);
     }
-    if (!cuda_ok(cudaGetLastError(), "glm qkv_norm_store kv-norm launch")) return 0;
+    if (!cuda_ok(cudaGetLastError(), "glm qkv_norm_store kv-norm launch")) { DS4_GLM_DBG_RET0(); return 0; }
 
     /* p2: raw (unrotated) rope tail into k_rope_cache[pos]. */
     const uint64_t total = (uint64_t)n_tokens * qk_rope;
@@ -2659,7 +2707,7 @@ extern "C" int ds4_gpu_glm_rope_tail_tensor(
         float           beta_fast,
         float           beta_slow) {
     /* Tail rotation: the rotated slice is the LAST rot_dim of each head. */
-    if (rot_dim > head_dim) return 0;
+    if (rot_dim > head_dim) { DS4_GLM_DBG_RET0(); return 0; }
     return glm_rope_offset_launch(x, n_tokens, n_head, head_dim, rot_dim,
                                   head_dim - rot_dim, pos0, n_ctx_orig,
                                   freq_base, freq_scale, ext_factor,
@@ -2847,7 +2895,7 @@ extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
         kv_raw->bytes < (uint64_t)n_tokens * kv_raw_dim * sizeof(float) ||
         kv_lora_cache->bytes < (uint64_t)cache_cap * kv_lora_dim * esize ||
         k_rope_cache->bytes < (uint64_t)cache_cap * qk_rope * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t total = (uint64_t)n_tokens * (kv_lora_dim + qk_rope);
     if (cache_f16) {
@@ -2895,16 +2943,16 @@ extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
         rot_dim == 0 || (rot_dim & 1u) != 0 || rot_dim > head_dim ||
         raw_k->bytes < (uint64_t)n_tokens * head_dim * sizeof(float) ||
         indexer_key_cache->bytes < (uint64_t)cache_cap * head_dim * esize) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t wb = (uint64_t)head_dim * sizeof(float);
-    if (weight_offset > model_size || wb > model_size - weight_offset) return 0;
-    if (bias_offset > model_size || wb > model_size - bias_offset) return 0;
+    if (weight_offset > model_size || wb > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
+    if (bias_offset > model_size || wb > model_size - bias_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const float *w = (const float *)cuda_model_range_ptr(model_map, weight_offset,
                                                          wb, "glm_indexer_k_norm");
     const float *b = (const float *)cuda_model_range_ptr(model_map, bias_offset,
                                                          wb, "glm_indexer_k_norm_b");
-    if (!w || !b) return 0;
+    if (!w || !b) { DS4_GLM_DBG_RET0(); return 0; }
     if (cache_f16) {
         glm_store_indexer_k_kernel<true><<<n_tokens, 128>>>(
                 (char *)indexer_key_cache->ptr,
@@ -2932,14 +2980,14 @@ extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
     if (!g_ssd_streaming_mode) return 1;
     if (!table || !selected || n_selected == 0 ||
         selected->bytes < (uint64_t)n_selected * sizeof(int32_t)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     int32_t stack_ids[GLM_CUDA_MAX_TOPK];
     int32_t *ids = stack_ids;
     int32_t *heap_ids = NULL;
     if (n_selected > GLM_CUDA_MAX_TOPK) {
         heap_ids = (int32_t *)malloc((size_t)n_selected * sizeof(int32_t));
-        if (!heap_ids) return 0;
+        if (!heap_ids) { DS4_GLM_DBG_RET0(); return 0; }
         ids = heap_ids;
     }
     int ok = ds4_gpu_tensor_read(selected, 0, ids, (uint64_t)n_selected * sizeof(int32_t));
@@ -2975,16 +3023,16 @@ extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
         kv_lora_dim == 0 || value_dim == 0 ||
         heads->bytes < (uint64_t)n_tokens * n_head * value_dim * sizeof(float) ||
         lora->bytes < (uint64_t)n_tokens * n_head * kv_lora_dim * sizeof(float)) {
-        return 0;
+        { DS4_GLM_DBG_RET0(); return 0; }
     }
     const uint64_t shmem = (uint64_t)kv_lora_dim * sizeof(float);
-    if (shmem > 48u * 1024u) return 0;
+    if (shmem > 48u * 1024u) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t row_bytes = glm_cuda_q8_row_bytes(kv_lora_dim);
     const uint64_t weight_bytes = (uint64_t)n_head * value_dim * row_bytes;
-    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+    if (weight_offset > model_size || weight_bytes > model_size - weight_offset) { DS4_GLM_DBG_RET0(); return 0; }
     const char *w = cuda_model_range_ptr(model_map, weight_offset,
                                          weight_bytes, "glm_attn_v_b");
-    if (!w) return 0;
+    if (!w) { DS4_GLM_DBG_RET0(); return 0; }
     dim3 grid(n_head, n_tokens, 1);
     glm_value_project_q8_0_batch_heads_kernel<<<grid, 256, (size_t)shmem>>>(
             (float *)heads->ptr,
@@ -3048,7 +3096,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
      * per-row CPU reference (swiglu, ds4.c). */
     if (!gate || !up || !mid || !x || !model_map ||
         in_dim == 0 || out_dim == 0 || n_tok == 0 ||
-        out_dim * n_tok > UINT32_MAX) return 0;
+        out_dim * n_tok > UINT32_MAX) { DS4_GLM_DBG_RET0(); return 0; }
     return ds4_gpu_matmul_q8_0_pair_tensor(gate, up,
                                            model_map, model_size,
                                            gate_offset, up_offset,
@@ -3074,10 +3122,10 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
     if (!mid || !x || !model_map || in_dim == 0 || out_dim == 0 ||
         out_dim > UINT32_MAX ||
         mid->bytes < out_dim * sizeof(float) ||
-        x->bytes < in_dim * sizeof(float)) return 0;
+        x->bytes < in_dim * sizeof(float)) { DS4_GLM_DBG_RET0(); return 0; }
     const uint64_t half_bytes = out_dim * sizeof(float);
     void *scratch = glm_swiglu_scratch_alloc(2u * half_bytes, "glm shared mid swiglu");
-    if (!scratch) return 0;
+    if (!scratch) { DS4_GLM_DBG_RET0(); return 0; }
     ds4_gpu_tensor gate_t;
     gate_t.ptr = scratch;
     gate_t.bytes = half_bytes;
