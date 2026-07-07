@@ -26766,7 +26766,8 @@ static bool glm_graph_indexed_decode_split_group8_available(uint32_t n_selected)
     const uint32_t block_rows = glm_graph_indexed_decode_split_block_rows_for(n_selected);
     const uint32_t needed_blocks =
         block_rows != 0u ? (n_selected + block_rows - 1u) / block_rows : 0u;
-    return n_selected > 512u &&
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_SPLIT_GROUP8) != 0 &&
+           n_selected > 512u &&
            block_rows > 0 &&
            needed_blocks > 0 &&
            needed_blocks <= glm_graph_indexed_decode_split_blocks() &&
@@ -28764,7 +28765,7 @@ static uint32_t glm_graph_q8_stripe_tokens(void) {
 }
 
 static bool glm_graph_flash_attention_prefill_enabled(void) {
-    return true;
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_FLASH) != 0;
 }
 
 static uint32_t glm_graph_flash_attention_prefill_min_tokens(void) {
@@ -28780,7 +28781,8 @@ static bool glm_graph_use_flash_attention_staged_kv(
         uint32_t pos0,
         uint32_t n_tokens,
         uint32_t cache_len) {
-    return pos0 == 0 &&
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_FLASH_STAGED) != 0 &&
+           pos0 == 0 &&
            n_tokens == cache_len;
 }
 
@@ -28818,7 +28820,7 @@ static bool glm_graph_indexed_prefill_scalar_indexer(void) {
 }
 
 static bool glm_graph_indexed_prefill_batch_indexer(void) {
-    return true;
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_BATCH_INDEXER) != 0;
 }
 
 static bool glm_graph_indexed_prefill_scalar_attn(void) {
@@ -28826,11 +28828,11 @@ static bool glm_graph_indexed_prefill_scalar_attn(void) {
 }
 
 static bool glm_graph_indexed_prefill_batch_qk_low(void) {
-    return true;
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_BATCH_QK_LOW) != 0;
 }
 
 static bool glm_graph_indexed_prefill_batch_attn_kernel(void) {
-    return true;
+    return (ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_BATCH_ATTN) != 0;
 }
 
 static uint32_t glm_graph_indexed_prefill_batch_attn_slice_tokens(void) {
@@ -38734,14 +38736,24 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
-        if (e->backend != DS4_BACKEND_METAL || !ds4_backend_uses_graph(e->backend)) {
+        const bool glm_cuda_experimental =
+            e->backend == DS4_BACKEND_CUDA &&
+            getenv("DS4_GLM_CUDA_EXPERIMENTAL") != NULL;
+        if ((e->backend != DS4_BACKEND_METAL && !glm_cuda_experimental) ||
+            !ds4_backend_uses_graph(e->backend)) {
             fprintf(stderr,
                     "ds4: GLM 5.2 tensor layout is recognized, but GLM inference is "
                     "currently Metal-only; use --inspect, --cpu --first-token-test, "
-                    "--metal --metal-graph-test, or limited --metal generation\n");
+                    "--metal --metal-graph-test, or limited --metal generation "
+                    "(set DS4_GLM_CUDA_EXPERIMENTAL=1 to try the in-progress CUDA port)\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
+        }
+        if (glm_cuda_experimental) {
+            fprintf(stderr,
+                    "ds4: WARNING: GLM on CUDA is an experimental in-progress port; "
+                    "outputs are not yet validated\n");
         }
 #ifndef DS4_NO_GPU
         if (opt->context_size > 0) {

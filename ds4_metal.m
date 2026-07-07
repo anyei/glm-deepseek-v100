@@ -7282,6 +7282,15 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
  * the distributed layer keeps using the TCP activation path. */
 int ds4_gpu_dist_ipc_supported(void) { return 0; }
 void ds4_gpu_bind_thread_device(void) {}
+
+uint32_t ds4_gpu_glm_kernel_caps(void) {
+    return DS4_GPU_GLM_CAP_FLASH |
+           DS4_GPU_GLM_CAP_FLASH_STAGED |
+           DS4_GPU_GLM_CAP_SPLIT_GROUP8 |
+           DS4_GPU_GLM_CAP_BATCH_ATTN |
+           DS4_GPU_GLM_CAP_BATCH_QK_LOW |
+           DS4_GPU_GLM_CAP_BATCH_INDEXER;
+}
 void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes, uint32_t slot_count,
                                     void *mem_handle_out, void *event_handles_out,
                                     void **events_out) {

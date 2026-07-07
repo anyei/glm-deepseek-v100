@@ -4583,6 +4583,7 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
  * unsupported so the distributed layer keeps the TCP activation path. */
 extern "C" int ds4_gpu_dist_ipc_supported(void) { return 0; }
 extern "C" void ds4_gpu_bind_thread_device(void) {}
+extern "C" uint32_t ds4_gpu_glm_kernel_caps(void) { return 0; }
 extern "C" void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes, uint32_t slot_count,
                                                void *mem_handle_out,
                                                void *event_handles_out,

@@ -50,6 +50,20 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
  * ========================================================================= */
 #define DS4_GPU_IPC_HANDLE_BYTES 64
 
+/* GLM kernel capability bits. The GLM graph in ds4.c picks fast-path
+ * kernels (flash attention, batched/fused variants) a priori, and a
+ * kernel that returns 0 is fatal — so each backend advertises which
+ * optional fast paths it actually implements and the graph routes to
+ * the scalar/simple kernels otherwise. Metal implements everything;
+ * the CUDA port grows bits as kernels land. */
+#define DS4_GPU_GLM_CAP_FLASH          0x00000001u
+#define DS4_GPU_GLM_CAP_FLASH_STAGED   0x00000002u
+#define DS4_GPU_GLM_CAP_SPLIT_GROUP8   0x00000004u
+#define DS4_GPU_GLM_CAP_BATCH_ATTN     0x00000008u
+#define DS4_GPU_GLM_CAP_BATCH_QK_LOW   0x00000010u
+#define DS4_GPU_GLM_CAP_BATCH_INDEXER  0x00000020u
+uint32_t ds4_gpu_glm_kernel_caps(void);
+
 int ds4_gpu_dist_ipc_supported(void);
 /* CUDA device selection is per-thread; every thread that touches the GPU
  * must bind itself to the device chosen at init (DS4_CUDA_DEVICE). No-op
