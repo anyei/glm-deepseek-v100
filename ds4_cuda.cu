@@ -1857,13 +1857,21 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
                                              down_expert_bytes,
                                              reclaim_bytes,
                                              reclaim_bytes == 0);
-    if (cap == 0) return NULL;
+    /* A grow attempt (capacity < target because the runtime memory cap is
+     * tighter than the configured budget) must never abandon a valid cache:
+     * live_budget consults free VRAM, which other graph buffers legitimately
+     * consume mid-token, so under pressure it returns a cap below the current
+     * capacity - or 0. Keep serving from what is already allocated and only
+     * regrow on real headroom (25% hysteresis so a marginal grow does not
+     * release a warm cache to gain a few slots). */
     if (same_dims &&
         g_stream_expert_cache.capacity != 0 &&
-        g_stream_expert_cache.capacity >= cap &&
-        g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity) {
+        g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity &&
+        (cap <= g_stream_expert_cache.capacity ||
+         cap - g_stream_expert_cache.capacity < g_stream_expert_cache.capacity / 4u)) {
         return &g_stream_expert_cache;
     }
+    if (cap == 0) return NULL;
 
     cuda_stream_expert_cache_release_all();
     while (cap != 0) {

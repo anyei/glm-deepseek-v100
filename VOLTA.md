@@ -94,12 +94,22 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
 
 **Pending (the performance phase):**
 
-- Throughput. The port is correctness-first: the phase-3 first working
-  run measured 0.15 t/s prefill / 0.16 t/s generation (Q2, cold
-  streaming, 8 GB expert cache). GLM 5.2 routes 75 layers x 8 experts
-  = 600 experts per token, so a per-token working set far above the
-  cache budget thrashes the NVMe path; expert-cache sizing, batched
-  expert staging, and the fast-path attention kernels are the levers.
+- Throughput. The port is correctness-first. Measured on Q2 from local
+  NVMe (V100 32GB, 25-token prompt): 0.15-0.17 t/s regardless of expert
+  budget before the expert-cache keep-alive fix; 0.22-0.26 t/s
+  generation after it (34-43% steady-state hit rate on a 1010-expert /
+  11.9 GiB cache, ~4 GiB still read per token). GLM 5.2 routes 75
+  layers x 8 experts = 600 experts x 11.81 MiB per token against a
+  ~138 GiB routed-expert pool, and the V100's other ~19 GiB is consumed
+  by the dense-weight arena (~17.6 GiB) plus KV/buffers, so on-GPU
+  caching alone cannot go much further. Next levers, in expected value
+  order: batch prefill expert staging per chunk instead of per token
+  (a full chunk needs each layer's experts once — up to ~50x on long
+  prompts), parallelize miss reads (measured 1.25 GB/s at QD~1 vs ~3.5
+  GB/s the NVMe can do), a host pinned-RAM L2 expert cache, and async
+  H2D overlap with compute. Host page cache does not help (measured:
+  buffered IO + kept pages changed nothing — token-to-token expert
+  reuse is too shallow for a ~6-token window).
 - The optional fast-path kernels (flash, staged KV, batched attention,
   split-group8 decode) are still stubs — the caps mask routes to scalar
   equivalents.
