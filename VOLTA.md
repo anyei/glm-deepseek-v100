@@ -1,13 +1,14 @@
 # DwarfStar on NVIDIA Volta (V100, sm_70)
 
-> **glm5.2 branch note:** GLM 5.2 inference is currently Metal-only
-> upstream (the ~30 `ds4_gpu_glm_*` kernels exist only in `ds4_metal.m`,
-> and `ds4_engine_open()` rejects GLM models on CUDA). This tree fixes
-> the branch's CUDA and CPU builds — which upstream left broken — so
-> DeepSeek models keep working on V100 with everything below; the GLM
-> CUDA entry points are loud-fail link stubs until real kernels exist.
-> The distributed GPU IPC fast path also declines GLM sessions (host
-> -pointer chunked eval) and falls back to TCP automatically.
+> **glm5.2 branch note:** GLM 5.2 inference is Metal-only upstream (the
+> `ds4_gpu_glm_*` kernels exist only in `ds4_metal.m`, and
+> `ds4_engine_open()` rejects GLM models on CUDA). This tree also fixes
+> the branch's CUDA and CPU builds — which upstream left broken — and
+> adds a **working CUDA port of the GLM kernels**, gated behind
+> `DS4_GLM_CUDA_EXPERIMENTAL=1` and numerically validated against the
+> CPU reference (see "GLM 5.2 CUDA port" below). The distributed GPU
+> IPC fast path still declines GLM sessions (host-pointer chunked eval)
+> and falls back to TCP automatically.
 
 This tree contains local changes to run and optimize ds4 on Tesla V100
 GPUs (Volta, compute capability 7.0). Upstream targets DGX Spark and
@@ -50,6 +51,63 @@ shared-memory opt-in (~64KB for the CUB top-k sort) checks
 `cudaDevAttrMaxSharedMemoryPerBlockOptin` at runtime and falls back
 cleanly (V100 allows 96KB), and no sm_80+ intrinsics (cp.async, bf16,
 `__reduce_*_sync`) are used anywhere.
+
+### GLM 5.2 CUDA port (`ds4_cuda_glm.inc`)
+
+Upstream implements the 32 `ds4_gpu_glm_*` entry points only in Metal.
+This tree ports them to CUDA in four phases (one commit each):
+
+1. **Infrastructure + MoE + elementwise** — the include structure,
+   router/MoE kernels, and elementwise/norm kernels.
+2. **Attention/KV/indexer core** — the 11 scalar-path kernels: indexer-K
+   store, compact KV stores, `k_b`/`v_b` Q8_0 projections, expanded KV
+   build with on-the-fly rope, dense causal attention with online
+   softmax, absorbed indexed-decode attention, and the
+   lightning-indexer scorers.
+3. **Bounded expert streaming** — routed experts stage on demand under
+   the SSD-streaming budget instead of mapping full multi-GiB tensors;
+   first end-to-end generation on CUDA.
+4. **IQ2_XXS experts + validation** — direct-f32 IQ2_XXS device dot for
+   the 16/16/16 routed layout, plus the numerical validation below.
+
+The scalar correctness path is complete; the remaining stubs are the
+optional fast-path variants (flash/staged/batched attention, split-
+group8 decode, batched low-rank QK) that `ds4_gpu_glm_kernel_caps()`
+routes around. `DS4_GLM_DEBUG=1` traces any host-side validation
+failure in the GLM include.
+
+**Numerical validation (2026-07-07):** single raw-token prompt through
+GLM-5.2 IQ2_XXS (211 GB GGUF, 79 layers), CPU reference on one host vs
+this CUDA port on a V100 reading the same file over an sshfs/rclone
+mount: top-8 tokens identical in identical order (argmax
+`<|endoftext|>`, CPU 6.4550 vs CUDA 6.4602), max logit delta 0.036,
+logit rms 7.151 vs 7.158 — within f32 reduction-order noise. Q2 GLM
+generation and DeepSeek regressions still pass.
+
+Running it (gated while the performance work is in progress):
+
+```sh
+DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 8GB \
+  --ctx 1024 -p "hello"
+```
+
+**Pending (the performance phase):**
+
+- Throughput. The port is correctness-first: the phase-3 first working
+  run measured 0.15 t/s prefill / 0.16 t/s generation (Q2, cold
+  streaming, 8 GB expert cache). GLM 5.2 routes 75 layers x 8 experts
+  = 600 experts per token, so a per-token working set far above the
+  cache budget thrashes the NVMe path; expert-cache sizing, batched
+  expert staging, and the fast-path attention kernels are the levers.
+- The optional fast-path kernels (flash, staged KV, batched attention,
+  split-group8 decode) are still stubs — the caps mask routes to scalar
+  equivalents.
+- Broader validation: one prompt on IQ2_XXS (plus Q2 generation spot
+  checks) so far; the 100-case official fixture should gate before the
+  `DS4_GLM_CUDA_EXPERIMENTAL` gate and the startup WARNING are removed.
+- Distributed: GPU IPC / distributed sessions still decline GLM and
+  fall back to TCP or single-GPU.
 
 ### Docker build from the local tree (`Dockerfile`)
 
