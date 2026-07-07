@@ -7289,7 +7289,8 @@ uint32_t ds4_gpu_glm_kernel_caps(void) {
            DS4_GPU_GLM_CAP_SPLIT_GROUP8 |
            DS4_GPU_GLM_CAP_BATCH_ATTN |
            DS4_GPU_GLM_CAP_BATCH_QK_LOW |
-           DS4_GPU_GLM_CAP_BATCH_INDEXER;
+           DS4_GPU_GLM_CAP_BATCH_INDEXER |
+           DS4_GPU_GLM_CAP_TOKEN_MAJOR_PREFILL;
 }
 void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes, uint32_t slot_count,
                                     void *mem_handle_out, void *event_handles_out,

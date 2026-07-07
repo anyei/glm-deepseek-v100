@@ -31987,6 +31987,9 @@ static bool glm_graph_use_streaming_token_prefill(
         uint32_t                 pos0,
         uint32_t                 n_tokens) {
     if (!g || !g->ssd_streaming || g->quality || n_tokens == 0) return false;
+    if ((ds4_gpu_glm_kernel_caps() & DS4_GPU_GLM_CAP_TOKEN_MAJOR_PREFILL) == 0) {
+        return false;
+    }
     if (getenv("DS4_GLM_DISABLE_STREAMING_TOKEN_PREFILL") != NULL ||
         getenv("DS4_METAL_GLM_DISABLE_STREAMING_TOKEN_PREFILL") != NULL) {
         return false;

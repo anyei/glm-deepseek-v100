@@ -62,6 +62,13 @@ int ds4_gpu_tensor_copy_f32_to_f16(ds4_gpu_tensor *dst, uint64_t dst_offset,
 #define DS4_GPU_GLM_CAP_BATCH_ATTN     0x00000008u
 #define DS4_GPU_GLM_CAP_BATCH_QK_LOW   0x00000010u
 #define DS4_GPU_GLM_CAP_BATCH_INDEXER  0x00000020u
+/* Policy bit, not a kernel: token-major streaming prefill re-reads every
+ * routed layer's experts once per token, which is only profitable when
+ * streamed weights are host-memory priced (Metal unified memory). Backends
+ * that stage experts from disk per wave (CUDA SSD streaming) must not
+ * advertise it: layer-major batched prefill reads each layer's experts
+ * once per chunk instead (measured 2-6x prefill on Q2 GLM from NVMe). */
+#define DS4_GPU_GLM_CAP_TOKEN_MAJOR_PREFILL 0x00000040u
 uint32_t ds4_gpu_glm_kernel_caps(void);
 
 int ds4_gpu_dist_ipc_supported(void);

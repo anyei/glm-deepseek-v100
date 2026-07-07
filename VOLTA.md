@@ -102,14 +102,19 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   layers x 8 experts = 600 experts x 11.81 MiB per token against a
   ~138 GiB routed-expert pool, and the V100's other ~19 GiB is consumed
   by the dense-weight arena (~17.6 GiB) plus KV/buffers, so on-GPU
-  caching alone cannot go much further. Next levers, in expected value
-  order: batch prefill expert staging per chunk instead of per token
-  (a full chunk needs each layer's experts once — up to ~50x on long
-  prompts), parallelize miss reads (measured 1.25 GB/s at QD~1 vs ~3.5
-  GB/s the NVMe can do), a host pinned-RAM L2 expert cache, and async
-  H2D overlap with compute. Host page cache does not help (measured:
-  buffered IO + kept pages changed nothing — token-to-token expert
-  reuse is too shallow for a ~6-token window).
+  caching alone cannot go much further. Prefill now always uses the
+  layer-major batched path on CUDA (token-major streaming prefill is a
+  Metal-only policy via DS4_GPU_GLM_CAP_TOKEN_MAJOR_PREFILL): each
+  layer's unique experts stage once per chunk instead of once per
+  token — measured 0.16 -> 0.96 t/s on a 188-token prompt (6x) and
+  0.16 -> 0.32 t/s at 25 tokens (2x); the advantage grows with chunk
+  size toward the 1024-token cap. Next levers, in expected value
+  order: parallelize miss reads (measured 1.25 GB/s at QD~1 vs ~3.5
+  GB/s the NVMe can do), a host pinned-RAM L2 expert cache (routing is
+  strongly skewed: a 1010-expert cache = ~5% of the pool sustains
+  34-43% hits), and async H2D overlap with compute. Host page cache
+  does not help (measured: buffered IO + kept pages changed nothing —
+  token-to-token expert reuse is too shallow for a ~6-token window).
 - The optional fast-path kernels (flash, staged KV, batched attention,
   split-group8 decode) are still stubs — the caps mask routes to scalar
   equivalents.
