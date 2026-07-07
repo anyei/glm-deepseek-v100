@@ -12465,7 +12465,8 @@ static int routed_moe_launch(
         float clamp,
         const ds4_gpu_tensor *x,
         uint32_t layer_index,
-        uint32_t n_tokens) {
+        uint32_t n_tokens,
+        bool force_resident) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
         n_tokens == 0 || n_total_expert == 0 || n_expert == 0 ||
         expert_in_dim % CUDA_QK_K != 0 || expert_mid_dim % CUDA_QK_K != 0 ||
@@ -12491,6 +12492,7 @@ static int routed_moe_launch(
     }
     const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
     const int use_stream_selected_cache =
+        !force_resident &&
         g_ssd_streaming_mode &&
         g_stream_selected_cache.valid &&
         g_stream_selected_cache.model_map == model_map &&
@@ -13149,7 +13151,7 @@ extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected,
     return 1;
 }
 
-extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index) {
+extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, bool force_resident) {
     return routed_moe_launch(out, gate, up, mid, down, model_map, model_size,
                              gate_offset, up_offset, down_offset,
                              gate_type, down_type,
@@ -13157,7 +13159,7 @@ extern "C" int ds4_gpu_routed_moe_one_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, 1);
+                             layer_index, 1, force_resident);
 }
 extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset, uint32_t gate_type, uint32_t down_type, uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights, uint32_t n_total_expert, uint32_t n_expert, float clamp, const ds4_gpu_tensor *x, uint32_t layer_index, uint32_t n_tokens, bool *mid_is_f16) {
     if (mid_is_f16) *mid_is_f16 = false;
@@ -13168,7 +13170,7 @@ extern "C" int ds4_gpu_routed_moe_batch_tensor(ds4_gpu_tensor *out, ds4_gpu_tens
                              down_expert_bytes, down_row_bytes,
                              expert_in_dim, expert_mid_dim, out_dim,
                              selected, weights, n_total_expert, n_expert, clamp, x,
-                             layer_index, n_tokens);
+                             layer_index, n_tokens, false);
 }
 extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *mix, const void *model_map, uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint32_t n_hc, uint32_t sinkhorn_iters, float eps) {
     if (!out || !mix || !model_map || n_hc != 4) return 0;
@@ -13485,4 +13487,671 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
                                         weight_offset, in_dim, out_dim, x, 1) &&
            ds4_gpu_hc_expand_split_tensor(out_hc, block_out, residual_hc,
                                             split, n_embd, n_hc);
+}
+
+/* =========================================================================
+ * GLM 5.2 backend stubs.
+ *
+ * The GLM graph kernels are implemented only in the Metal backend so far;
+ * ds4_engine_open() rejects GLM models on CUDA before any of these can
+ * run. The stubs exist so the CUDA build links, and they fail loudly if
+ * that invariant is ever broken.
+ * ========================================================================= */
+
+static void ds4_cuda_glm_stub_note(const char *fn) {
+    static int printed;
+    if (!printed) {
+        printed = 1;
+        fprintf(stderr, "ds4: BUG: %s reached on the CUDA backend, but GLM kernels are Metal-only\n", fn);
+    }
+}
+
+extern "C" int ds4_gpu_add3_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *c,
+        uint32_t                n) {
+    ds4_cuda_glm_stub_note("ds4_gpu_add3_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_add_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps) {
+    ds4_cuda_glm_stub_note("ds4_gpu_add_rms_norm_weight_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_embed_token_q8_0_tensor(
+        ds4_gpu_tensor *out,
+        const void       *model_map,
+        uint64_t          model_size,
+        uint64_t          weight_offset,
+        uint32_t          n_vocab,
+        uint32_t          token,
+        uint32_t          n_embd) {
+    ds4_cuda_glm_stub_note("ds4_gpu_embed_token_q8_0_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_embed_tokens_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *tokens,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n_vocab,
+        uint32_t                n_tokens,
+        uint32_t                n_embd) {
+    ds4_cuda_glm_stub_note("ds4_gpu_embed_tokens_q8_0_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_flush_encoder(void) {
+    ds4_cuda_glm_stub_note("ds4_gpu_flush_encoder");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_flash_staged_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_flash_staged_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_flash_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_flash_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_full_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *key_cache,
+        const ds4_gpu_tensor *value_cache,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_len,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              qk_dim,
+        uint32_t              value_dim,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_full_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_lora_causal_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor(
+        ds4_gpu_tensor       *lora_out,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_lora_valid_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_batch_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_tokens,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_attention_indexed_decode_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *qk_low,
+        const ds4_gpu_tensor *kv_lora_cache,
+        const ds4_gpu_tensor *k_rope_cache,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              value_weight_offset,
+        const ds4_gpu_tensor *selected,
+        uint32_t              n_selected,
+        uint32_t              cache_cap,
+        bool                  cache_f16,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_attention_indexed_decode_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_build_kv_cache_flash_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *kv_raw,
+        const ds4_gpu_tensor *k_nope,
+        const ds4_gpu_tensor *value,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_build_kv_cache_flash_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_build_kv_cache_tensor(
+        ds4_gpu_tensor       *key_cache,
+        ds4_gpu_tensor       *value_cache,
+        const ds4_gpu_tensor *kv_raw,
+        const ds4_gpu_tensor *k_nope,
+        const ds4_gpu_tensor *value,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              n_head,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_rope,
+        uint32_t              value_dim,
+        uint32_t              n_ctx_orig,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_build_kv_cache_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_fill_selected_range_batch_tensor(
+        ds4_gpu_tensor *selected,
+        uint32_t        n_tokens,
+        uint32_t        pos0,
+        uint32_t        n_selected,
+        uint32_t        pad_row) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_fill_selected_range_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_fill_selected_range_tensor(
+        ds4_gpu_tensor *selected,
+        uint32_t        n_selected) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_fill_selected_range_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_indexer_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        rot_dim,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_indexer_rope_tail_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_indexer_score_one_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_indexer_score_one_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_indexer_scores_batch_tensor(
+        ds4_gpu_tensor       *scores,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *indexer_key_cache,
+        uint32_t              n_rows,
+        uint32_t              n_tokens,
+        uint32_t              pos0,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        float                 scale,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_indexer_scores_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_k_b_project_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *kv_norm,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              n_head) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_k_b_project_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_kv_lora_rms_norm_tensor(
+        ds4_gpu_tensor       *out,
+        const ds4_gpu_tensor *kv_raw,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_lora_dim,
+        float                 eps) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_kv_lora_rms_norm_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor(
+        ds4_gpu_tensor       *qk_low,
+        const ds4_gpu_tensor *q,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_dim) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_qk_lowrank_q8_0_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_qk_lowrank_q8_0_tensor(
+        ds4_gpu_tensor       *qk_low,
+        const ds4_gpu_tensor *q,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_nope,
+        uint32_t              qk_dim) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_qk_lowrank_q8_0_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_qkv_norm_store_compact_kv_tensor(
+        ds4_gpu_tensor       *q_out,
+        const ds4_gpu_tensor *q,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint32_t              q_n,
+        ds4_gpu_tensor       *kv_lora_cache,
+        ds4_gpu_tensor       *k_rope_cache,
+        const ds4_gpu_tensor *kv_raw,
+        uint64_t              kv_weight_offset,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_rope,
+        bool                  cache_f16,
+        float                 eps) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_qkv_norm_store_compact_kv_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_rope_tail_tensor(
+        ds4_gpu_tensor *x,
+        uint32_t        n_tokens,
+        uint32_t        n_head,
+        uint32_t        head_dim,
+        uint32_t        rot_dim,
+        uint32_t        pos0,
+        uint32_t        n_ctx_orig,
+        float           freq_base,
+        float           freq_scale,
+        float           ext_factor,
+        float           attn_factor,
+        float           beta_fast,
+        float           beta_slow) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_rope_tail_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                up_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        uint32_t                layer_index,
+        const ds4_gpu_tensor *x,
+        uint32_t                n_tokens,
+        uint32_t                mid_token_stride) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_routed_moe_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_routed_moe_one_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                down_offset,
+        uint32_t                gate_type,
+        uint32_t                up_type,
+        uint32_t                down_type,
+        uint64_t                gate_expert_bytes,
+        uint64_t                gate_row_bytes,
+        uint64_t                up_expert_bytes,
+        uint64_t                up_row_bytes,
+        uint64_t                down_expert_bytes,
+        uint64_t                down_row_bytes,
+        uint32_t                expert_in_dim,
+        uint32_t                expert_mid_dim,
+        uint32_t                out_dim,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *weights,
+        uint32_t                n_total_expert,
+        uint32_t                n_expert,
+        uint32_t                layer_index,
+        const ds4_gpu_tensor *x,
+        bool                    force_resident) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_routed_moe_one_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_router_select_batch_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_router_select_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        const ds4_gpu_tensor *logits,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_router_select_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_store_compact_kv_tensor(
+        ds4_gpu_tensor       *kv_lora_cache,
+        ds4_gpu_tensor       *k_rope_cache,
+        const ds4_gpu_tensor *kv_norm,
+        const ds4_gpu_tensor *kv_raw,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              kv_raw_dim,
+        uint32_t              kv_lora_dim,
+        uint32_t              qk_rope,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_store_compact_kv_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_store_indexer_k_tensor(
+        ds4_gpu_tensor       *indexer_key_cache,
+        const ds4_gpu_tensor *raw_k,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              bias_offset,
+        uint32_t              pos0,
+        uint32_t              n_tokens,
+        uint32_t              cache_cap,
+        uint32_t              head_dim,
+        uint32_t              rot_dim,
+        uint32_t              n_ctx_orig,
+        float                 eps,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        bool                  cache_f16) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_store_indexer_k_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
+        const ds4_gpu_stream_expert_table *table,
+        const ds4_gpu_tensor              *selected,
+        uint32_t                           n_selected) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_glm_value_project_q8_0_batch_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const ds4_gpu_tensor *lora,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint32_t              n_tokens,
+        uint32_t              n_head,
+        uint32_t              kv_lora_dim,
+        uint32_t              value_dim) {
+    ds4_cuda_glm_stub_note("ds4_gpu_glm_value_project_q8_0_batch_heads_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    ds4_cuda_glm_stub_note("ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    ds4_cuda_glm_stub_note("ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   clamp) {
+    ds4_cuda_glm_stub_note("ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor");
+    return 0;
+}
+
+extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    ds4_cuda_glm_stub_note("ds4_gpu_shared_mid_swiglu_q8_0_tensor");
+    return 0;
 }

@@ -34288,6 +34288,18 @@ static void session_cpu_reset_cache(ds4_session *s) {
     kv_cache_init(&s->cpu_cache, (uint32_t)s->ctx_size, 0);
 }
 
+#ifdef DS4_NO_GPU
+/* The GLM graph lives in the GPU-only region, but the executable layer
+ * count is pure shape arithmetic that layer-range validation needs in
+ * CPU builds too. */
+static uint32_t glm_graph_normal_layer_count(void) {
+    if (DS4_N_LAYER <= DS4_N_NEXTN_PREDICT || DS4_N_LAYER > DS4_MAX_LAYER) {
+        return 0;
+    }
+    return DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+}
+#endif
+
 static bool ds4_layer_payload_range_valid(uint32_t layer_start, uint32_t layer_end) {
     uint32_t n_layers = (uint32_t)DS4_N_LAYER;
     if (DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_GLM_DSA) {

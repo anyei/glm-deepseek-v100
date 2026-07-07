@@ -1,5 +1,14 @@
 # DwarfStar on NVIDIA Volta (V100, sm_70)
 
+> **glm5.2 branch note:** GLM 5.2 inference is currently Metal-only
+> upstream (the ~30 `ds4_gpu_glm_*` kernels exist only in `ds4_metal.m`,
+> and `ds4_engine_open()` rejects GLM models on CUDA). This tree fixes
+> the branch's CUDA and CPU builds — which upstream left broken — so
+> DeepSeek models keep working on V100 with everything below; the GLM
+> CUDA entry points are loud-fail link stubs until real kernels exist.
+> The distributed GPU IPC fast path also declines GLM sessions (host
+> -pointer chunked eval) and falls back to TCP automatically.
+
 This tree contains local changes to run and optimize ds4 on Tesla V100
 GPUs (Volta, compute capability 7.0). Upstream targets DGX Spark and
 modern CUDA GPUs; Volta needs two extra considerations:
