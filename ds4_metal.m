@@ -7278,6 +7278,37 @@ int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *dat
     return 1;
 }
 
+/* Distributed same-host GPU IPC is CUDA-only; Metal reports unsupported so
+ * the distributed layer keeps using the TCP activation path. */
+int ds4_gpu_dist_ipc_supported(void) { return 0; }
+void ds4_gpu_bind_thread_device(void) {}
+void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes, uint32_t slot_count,
+                                    void *mem_handle_out, void *event_handles_out,
+                                    void **events_out) {
+    (void)bytes; (void)slot_count; (void)mem_handle_out;
+    (void)event_handles_out; (void)events_out;
+    return NULL;
+}
+void ds4_gpu_dist_ipc_inbox_destroy(void *dev_ptr, void **events, uint32_t slot_count) {
+    (void)dev_ptr; (void)events; (void)slot_count;
+}
+void *ds4_gpu_dist_ipc_open_mem(const void *mem_handle) { (void)mem_handle; return NULL; }
+void ds4_gpu_dist_ipc_close_mem(void *mapped) { (void)mapped; }
+void *ds4_gpu_dist_ipc_open_event(const void *event_handle) { (void)event_handle; return NULL; }
+void ds4_gpu_dist_ipc_close_event(void *event) { (void)event; }
+int ds4_gpu_dist_ipc_event_wait(void *event) { (void)event; return 0; }
+int ds4_gpu_tensor_write_from_devptr(ds4_gpu_tensor *tensor, uint64_t offset,
+                                     const void *src_dev, uint64_t bytes,
+                                     void *notify_event) {
+    (void)tensor; (void)offset; (void)src_dev; (void)bytes; (void)notify_event;
+    return 0;
+}
+int ds4_gpu_tensor_read_to_devptr(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                  void *dst_dev, uint64_t bytes) {
+    (void)tensor; (void)offset; (void)dst_dev; (void)bytes;
+    return 0;
+}
+
 int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                           const ds4_gpu_tensor *src, uint64_t src_offset,
                           uint64_t bytes) {
