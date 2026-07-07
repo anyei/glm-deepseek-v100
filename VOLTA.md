@@ -112,11 +112,16 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   small reader-thread pool (8 workers, `DS4_CUDA_STREAM_READ_THREADS`,
   0 restores the serial path): NVMe 1.25 -> 1.9 GB/s, decode 0.23 ->
   0.35 t/s and 188-token prefill 0.99 -> 1.51 t/s (1.5x each).
-  Next levers, in expected value order: a host pinned-RAM L2 expert
-  cache (routing is strongly skewed: a 1010-expert cache = ~5% of the
-  pool sustains 34-43% hits), closing the remaining NVMe headroom
-  (~1.9 of ~3.5 GB/s — per-worker event sync against the shared upload
-  stream is the suspect), and async H2D overlap with compute. Host page cache
+  An optional pinned-host L2 expert cache
+  (`DS4_CUDA_HOST_EXPERT_CACHE_GB`, off by default) serves decode
+  misses over PCIe instead of NVMe: at 28 GB (~2.4x the GPU tier) it
+  measured 58% combined hits, disk traffic 4.7 -> 3.0 GiB/token, and
+  decode 0.35 -> 0.40 t/s. Size it at 2x the GPU expert budget or more
+  — both tiers fill from the same miss stream, so a same-size L2 adds
+  almost nothing — and remember pinned pages are not reclaimable by
+  the OS. Next levers: closing the remaining NVMe headroom (~1.9 of
+  ~3.5 GB/s — per-worker event sync against the shared upload stream
+  is the suspect), and async H2D overlap with compute. Host page cache
   does not help (measured: buffered IO + kept pages changed nothing —
   token-to-token expert reuse is too shallow for a ~6-token window).
 - The optional fast-path kernels (flash, staged KV, batched attention,
