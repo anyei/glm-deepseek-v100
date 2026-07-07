@@ -119,11 +119,19 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   decode 0.35 -> 0.40 t/s. Size it at 2x the GPU expert budget or more
   — both tiers fill from the same miss stream, so a same-size L2 adds
   almost nothing — and remember pinned pages are not reclaimable by
-  the OS. Next levers: closing the remaining NVMe headroom (~1.9 of
-  ~3.5 GB/s — per-worker event sync against the shared upload stream
-  is the suspect), and async H2D overlap with compute. Host page cache
-  does not help (measured: buffered IO + kept pages changed nothing —
-  token-to-token expert reuse is too shallow for a ~6-token window).
+  the OS. Keep the GPU expert budget high alongside it: shrinking
+  `--ssd-streaming-cache-experts` to 8-12 GB to "free VRAM" measured
+  strictly worse (0.33 vs 0.40 t/s) — the GPU tier's hits are free HBM
+  reads, and the dense/shared weights need no help (they fd-cache into
+  VRAM on first touch; a profiler artifact that suggested otherwise is
+  documented in VALIDATION.md). Best measured decode config: 26 GB
+  expert budget + 28 GB host L2. Next levers: the last of the NVMe
+  headroom (measured device ceiling ~2.45 GB/s for 4 MiB reads, QD1
+  already delivers 1.98 — so at most ~25% remains), per-layer overhead
+  trims (D2D mirror copies, cache scans), and cache admission policy.
+  Host page cache does not help (measured: buffered IO + kept pages
+  changed nothing — token-to-token expert reuse is too shallow for a
+  ~6-token window).
 - The optional fast-path kernels (flash, staged KV, batched attention,
   split-group8 decode) are still stubs — the caps mask routes to scalar
   equivalents.

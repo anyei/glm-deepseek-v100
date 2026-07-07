@@ -194,10 +194,17 @@ Per-stage decode timing (one layer) plus the streaming-staging split:
 -e DS4_METAL_GLM_STREAMING_ASYNC_PROFILE=1
 ```
 
-Red flag: `shared_gate_up_swiglu` at multiple ms/layer (healthy: well
-under 1 ms) means dense/shared weights are re-copied from the host every
-call — the expert budget is starving the dense-weight arena; lower
-`--ssd-streaming-cache-experts`.
+Interpretation caveat: `shared_gate_up_swiglu` reads as 8-30 ms/layer
+under streaming, but that is NOT the shared-expert GEMV (which is
+sub-ms) — the per-layer expert staging IO runs between the `router`
+and `shared_gate_up_swiglu` stage boundaries, so the profiler
+attributes the whole ~95 MiB expert load to this stage. Verified
+2026-07-07: dense/shared weights are fd-cached in VRAM after first
+touch (`DS4_CUDA_WEIGHT_CACHE_VERBOSE=1` shows `fd-cached` lines, zero
+`CUDA direct` fallbacks). The number is therefore a per-layer
+staging-cost probe: it should shrink as cache hit rates rise, and a
+genuine dense-weight regression would instead show `CUDA direct`
+fallback lines in the weight-cache-verbose output.
 
 Direct I/O status (`align=4096` at startup; any later `disabled` line is
 a regression):
