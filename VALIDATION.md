@@ -194,6 +194,20 @@ Per-stage decode timing (one layer) plus the streaming-staging split:
 -e DS4_METAL_GLM_STREAMING_ASYNC_PROFILE=1
 ```
 
+Staging-phase attribution (aggregate, printed at exit; near-zero cost):
+
+```sh
+-e DS4_CUDA_STREAM_STAGE_TIMING=1
+# ds4: CUDA staging timing calls=... total=... classify+hitD2D=... io=... missD2D=... upload=...
+```
+
+Reference at the best config (26 GB + 28 GB L2, 32-token decode): io
+~2.0 s/token and device-bound; missD2D and upload ~10 ms/token
+combined. Caveat: classify+hitD2D issues synchronous D2D copies that
+wait for all queued GPU work, so it absorbs pipeline drain and swings
+several seconds between identical runs — treat it as
+compute-plus-drain, not a scan cost.
+
 Interpretation caveat: `shared_gate_up_swiglu` reads as 8-30 ms/layer
 under streaming, but that is NOT the shared-expert GEMV (which is
 sub-ms) — the per-layer expert staging IO runs between the `router`

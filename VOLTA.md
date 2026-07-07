@@ -125,10 +125,18 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
   reads, and the dense/shared weights need no help (they fd-cache into
   VRAM on first touch; a profiler artifact that suggested otherwise is
   documented in VALIDATION.md). Best measured decode config: 26 GB
-  expert budget + 28 GB host L2. Next levers: the last of the NVMe
-  headroom (measured device ceiling ~2.45 GB/s for 4 MiB reads, QD1
-  already delivers 1.98 — so at most ~25% remains), per-layer overhead
-  trims (D2D mirror copies, cache scans), and cache admission policy.
+  expert budget + 28 GB host L2. Staging-phase attribution
+  (`DS4_CUDA_STREAM_STAGE_TIMING=1`, exit summary) puts the decode
+  token at ~2.0 s of device-bound read time (insensitive to worker
+  count 8-18 and to the page-drop hints; the real device rate for the
+  3-tensors-per-expert pattern is ~1.9-2.0 GB/s against a ~2.45 GB/s
+  synthetic ceiling) plus ~0.8 s of GPU compute and pipeline drain.
+  The remaining levers are therefore the scalar kernels (routed MoE
+  measures 3.3 ms/layer), cache admission policy, and quantization
+  choices — not IO. Note when reading the timing summary: the
+  classify+hitD2D bucket absorbs GPU pipeline drain via its
+  synchronous D2D copies, so it fluctuates run to run and mostly
+  double-counts compute.
   Host page cache does not help (measured: buffered IO + kept pages
   changed nothing — token-to-token expert reuse is too shallow for a
   ~6-token window).

@@ -2088,7 +2088,15 @@ static struct {
     uint32_t capacity;
     uint64_t tick;
     std::vector<cuda_host_expert_slot> slots;
+    /* (layer, expert) -> slot. A linear scan over thousands of slots per
+     * lookup measured ~0.23 s/token; the map keeps classify flat. The full
+     * key still lives in the slot and is verified on every hit. */
+    std::unordered_map<uint64_t, uint32_t> index;
 } g_host_expert_cache;
+
+static uint64_t cuda_host_expert_cache_key(uint32_t layer, uint32_t expert) {
+    return ((uint64_t)layer << 32) | (uint64_t)expert;
+}
 
 static uint64_t cuda_host_expert_cache_budget_bytes(void) {
     /* Opt-in: pinned pages are not reclaimable, and a tier that is not
@@ -2128,6 +2136,7 @@ static void cuda_host_expert_cache_release(void) {
     if (g_host_expert_cache.arena) {
         (void)cudaFreeHost(g_host_expert_cache.arena);
     }
+    g_host_expert_cache.index.clear();
     g_host_expert_cache.slots.clear();
     g_host_expert_cache.arena = NULL;
     g_host_expert_cache.capacity = 0;
@@ -2143,6 +2152,7 @@ static void cuda_host_expert_cache_invalidate(void) {
     for (cuda_host_expert_slot &slot : g_host_expert_cache.slots) {
         slot.valid = 0;
     }
+    g_host_expert_cache.index.clear();
     g_host_expert_cache.tick = 0;
 }
 
@@ -2255,28 +2265,36 @@ static int cuda_host_expert_cache_find(
         uint64_t down_offset,
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
-    for (uint32_t i = 0; i < g_host_expert_cache.capacity; i++) {
-        const cuda_host_expert_slot &slot = g_host_expert_cache.slots[i];
-        if (slot.valid &&
-            slot.model_map == model_map &&
-            slot.model_size == model_size &&
-            slot.layer == layer &&
-            slot.n_total_expert == n_total_expert &&
-            slot.expert == expert &&
-            slot.gate_offset == gate_offset &&
-            slot.up_offset == up_offset &&
-            slot.down_offset == down_offset &&
-            slot.gate_expert_bytes == gate_expert_bytes &&
-            slot.down_expert_bytes == down_expert_bytes) {
-            return (int)i;
-        }
+    const auto it = g_host_expert_cache.index.find(
+            cuda_host_expert_cache_key(layer, expert));
+    if (it == g_host_expert_cache.index.end()) return -1;
+    const uint32_t i = it->second;
+    if (i >= g_host_expert_cache.capacity) return -1;
+    const cuda_host_expert_slot &slot = g_host_expert_cache.slots[i];
+    if (slot.valid &&
+        slot.model_map == model_map &&
+        slot.model_size == model_size &&
+        slot.layer == layer &&
+        slot.n_total_expert == n_total_expert &&
+        slot.expert == expert &&
+        slot.gate_offset == gate_offset &&
+        slot.up_offset == up_offset &&
+        slot.down_offset == down_offset &&
+        slot.gate_expert_bytes == gate_expert_bytes &&
+        slot.down_expert_bytes == down_expert_bytes) {
+        return (int)i;
     }
     return -1;
 }
 
 static uint32_t cuda_host_expert_cache_lru_slot(void) {
-    for (uint32_t i = 0; i < g_host_expert_cache.capacity; i++) {
-        if (!g_host_expert_cache.slots[i].valid) return i;
+    /* Filling phase: the map size tracks occupied slots, so the next free
+     * one is simply the count so far (evictions replace their entry). */
+    if (g_host_expert_cache.index.size() <
+        (size_t)g_host_expert_cache.capacity) {
+        for (uint32_t i = 0; i < g_host_expert_cache.capacity; i++) {
+            if (!g_host_expert_cache.slots[i].valid) return i;
+        }
     }
     uint32_t slot = 0;
     uint64_t best_age = g_host_expert_cache.slots[0].age;
@@ -3622,6 +3640,48 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
     return 1;
 }
 
+/* Aggregate staging-phase timing (DS4_CUDA_STREAM_STAGE_TIMING=1): where
+ * the per-call wall time of begin_compact_load goes, printed at exit. */
+static struct {
+    int      checked;
+    int      enabled;
+    double   classify_ms; /* cache scans + hit D2D mirrors */
+    double   io_ms;       /* batched reads/copies until resident */
+    double   mirror_ms;   /* miss slot -> compact D2D mirrors */
+    double   upload_ms;   /* slot-id table upload */
+    uint64_t calls;
+    uint64_t decode_calls;
+} g_stream_stage_timing;
+
+static void cuda_stream_stage_timing_print(void) {
+    const double total = g_stream_stage_timing.classify_ms +
+                         g_stream_stage_timing.io_ms +
+                         g_stream_stage_timing.mirror_ms +
+                         g_stream_stage_timing.upload_ms;
+    fprintf(stderr,
+            "ds4: CUDA staging timing calls=%llu (decode=%llu) total=%.0f ms: "
+            "classify+hitD2D=%.0f io=%.0f missD2D=%.0f upload=%.0f\n",
+            (unsigned long long)g_stream_stage_timing.calls,
+            (unsigned long long)g_stream_stage_timing.decode_calls,
+            total,
+            g_stream_stage_timing.classify_ms,
+            g_stream_stage_timing.io_ms,
+            g_stream_stage_timing.mirror_ms,
+            g_stream_stage_timing.upload_ms);
+}
+
+static int cuda_stream_stage_timing_enabled(void) {
+    if (!g_stream_stage_timing.checked) {
+        g_stream_stage_timing.checked = 1;
+        g_stream_stage_timing.enabled =
+            getenv("DS4_CUDA_STREAM_STAGE_TIMING") != NULL;
+        if (g_stream_stage_timing.enabled) {
+            atexit(cuda_stream_stage_timing_print);
+        }
+    }
+    return g_stream_stage_timing.enabled;
+}
+
 static int cuda_stream_selected_cache_begin_compact_load(
         const void    *model_map,
         uint64_t       model_size,
@@ -3640,6 +3700,8 @@ static int cuda_stream_selected_cache_begin_compact_load(
         int            allow_global_cache) {
     cuda_stream_selected_cache_invalidate();
     cuda_model_load_progress_finish();
+    const int stage_timing = cuda_stream_stage_timing_enabled();
+    double stage_t = stage_timing ? cuda_wall_sec() : 0.0;
 
     if (!g_ssd_streaming_mode) return 1;
     if (!model_map || !compact_ids || !slot_ids ||
@@ -3850,6 +3912,14 @@ static int cuda_stream_selected_cache_begin_compact_load(
                         const uint32_t hs = cuda_host_expert_cache_lru_slot();
                         cuda_host_expert_slot &hentry =
                             g_host_expert_cache.slots[hs];
+                        if (hentry.valid) {
+                            g_host_expert_cache.index.erase(
+                                    cuda_host_expert_cache_key(hentry.layer,
+                                                               hentry.expert));
+                        }
+                        g_host_expert_cache.index[
+                                cuda_host_expert_cache_key(layer,
+                                                           (uint32_t)expert)] = hs;
                         hentry.valid = 1;
                         hentry.model_map = model_map;
                         hentry.model_size = model_size;
@@ -3907,6 +3977,14 @@ static int cuda_stream_selected_cache_begin_compact_load(
         load_items.push_back(down_item);
     }
 
+    if (stage_timing) {
+        const double now = cuda_wall_sec();
+        g_stream_stage_timing.classify_ms += (now - stage_t) * 1000.0;
+        g_stream_stage_timing.calls++;
+        if (allow_global_cache) g_stream_stage_timing.decode_calls++;
+        stage_t = now;
+    }
+
     if (!load_items.empty() &&
         !cuda_stream_read_batch(model_map,
                                 model_size,
@@ -3962,6 +4040,12 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
+    if (stage_timing) {
+        const double now = cuda_wall_sec();
+        g_stream_stage_timing.io_ms += (now - stage_t) * 1000.0;
+        stage_t = now;
+    }
+
     /* Batch landed: account appended slots and mirror each filled slot into
      * its compact position. */
     for (uint32_t f = 0; f < fill_compact.size(); f++) {
@@ -3982,6 +4066,12 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
+    if (stage_timing) {
+        const double now = cuda_wall_sec();
+        g_stream_stage_timing.mirror_ms += (now - stage_t) * 1000.0;
+        stage_t = now;
+    }
+
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids,
                             (size_t)slot_count * sizeof(slot_ids[0]),
@@ -3989,6 +4079,10 @@ static int cuda_stream_selected_cache_begin_compact_load(
                  "streaming selected slot upload")) {
         cuda_stream_selected_cache_invalidate();
         return strict_failure ? 0 : 1;
+    }
+    if (stage_timing) {
+        g_stream_stage_timing.upload_ms +=
+            (cuda_wall_sec() - stage_t) * 1000.0;
     }
 
     g_stream_selected_cache.model_map = model_map;
