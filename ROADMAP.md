@@ -71,7 +71,55 @@ numerics-adjacent, so each goes through the VALIDATION.md §9 gate
   stubs routing to scalar equivalents (VOLTA.md:159). Routed-MoE measures
   3.3 ms/layer. Real, but secondary until reads shrink.
 
-## 3. Standing rule for every change above
+## 3. Code quality (deferred from the /simplify pass)
+
+A 4-agent `/simplify` review of the fork's V100/GLM code (2026-07-08) applied
+the safe, behavior-preserving dedups (commit `07472b6`: MoE forwarder alias,
+`ensure_i32`→`ensure_bytes`, shared staging-teardown/lap helpers, cached
+getenvs). These were **deferred** because each touches numeric or
+correctness-critical code and must go through the §4 gate — they can't just be
+committed blind on numerically-validated shipping code.
+
+- [ ] **Unify the triplicated selected-expert compaction + staging** (top
+  structural finding, flagged by 3 of 4 agents). The compact-id remap and the
+  stage/validate protocol are copy-pasted across `ds4_cuda.cu`
+  (`begin_selected_load`, `prepare_selected_batch`) and `ds4_cuda_glm.inc`
+  (`glm_cuda_stream_stage_selected`, `glm_routed_moe_launch`), and the copies
+  have **already drifted** — the `.inc` cache-hit predicate requires
+  `compact_count != 0`, the inline one in `routed_moe_launch` omits it; the
+  `.inc` compaction has an all-padding fallback the others lack. Extract one
+  `build_compaction()` + one `cuda_stream_selected_cache_hit()` predicate and
+  reconcile the differences deliberately. Correctness-critical (the contract is
+  shared with the kernels) → full §4 gate.
+- [ ] **Dedup the device-kernel numeric copies** (numerics-affecting → §4 gate,
+  expect a fixture re-run, not a delta-0 A/B). The ~11 open-coded block
+  reductions → `glm_block_reduce_sum/max` helpers; `glm_rope_offset_kernel`
+  re-inlines yarn math the file's own `glm_dev_rope_corr`/`glm_dev_rope_cs`
+  helpers already provide (and duplicates `rope_tail_kernel`); the new
+  `dev_iq2_xxs_dot_block_f32` duplicates the existing `dev_iq2_xxs_dot_f32`
+  (the sibling Q2_K arm already reuses the shared dot); the `dev_q{4,5,6}_K_dot_f32`
+  carry an always-`nb==1` loop. "Algebraically equal" ≠ bit-identical, so these
+  need the soak/fixture, not just the A/B.
+- [ ] **Consolidate env-var parsing** (behavior-adjacent — changes accepted
+  input syntax). ~11 near-duplicate `strtoul/strtoull` parse+clamp blocks with
+  inconsistent validation (some skip whitespace, the IPC pair accepts trailing
+  garbage, ad-hoc clamp ceilings). Route every knob through one bounded helper
+  per module (`cuda_parse_mib_env` / `dist_parse_positive_u32` already exist).
+
+The two efficiency findings below are perf, not cleanup — they belong to §2's
+hot-path work but were surfaced here:
+
+- [ ] **Per-layer allocator churn in the staging path** — `begin_selected_load`
+  / `begin_compact_load` / `glm_cuda_stream_stage_selected` allocate ~8–11
+  `std::vector`s per routed layer per token (~700–1000 mallocs/token on a cache
+  hit) plus an O(n_total_expert) memset. Hoist to reused file-scope buffers
+  (`.clear()`, retain capacity). Could move decode t/s.
+- [ ] **Forced D2H sync every decode layer even on cache hit** —
+  `glm_routed_moe_launch` does a blocking `ds4_gpu_tensor_read(selected)` per
+  layer just to re-validate staging (~90 sync points/token). Thread the
+  host-side router ids (already available in `ds4.c`) through instead.
+
+## 4. Standing rule for every change above
 
 Nontrivial runtime changes go through **VALIDATION.md §9**:
 
