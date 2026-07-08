@@ -135,14 +135,13 @@ Running it (on by default since the release gate passed;
   and warm decode reaches 0.45 t/s — and it makes the pinned-host L2
   redundant (0.2% residual hits), so prefer peer VRAM over host RAM
   when both are available. Best measured decode config: 26 GB expert
-  budget + 26 GB peer cache (host L2 off). Known issue: one long run
-  (the quality fixture) wedged after ~8 minutes with the peer tier on
-  — main thread stuck in a CUDA wait, both GPUs idle; short runs (up
-  to 96 tokens) never reproduced it. The suspected cause (worker
-  copies mislabeled cudaMemcpyHostToDevice for peer destinations) is
-  fixed — copies now use cudaMemcpyDefault — and a full-fixture soak
-  gates the all-clear; until then treat the peer tier as
-  benchmarking-only, not serving-ready. Staging-phase attribution
+  budget + 26 GB peer cache (host L2 off). An early long run wedged
+  after ~8 minutes with the peer tier on (worker copies mislabeled
+  cudaMemcpyHostToDevice for peer destinations); with the
+  cudaMemcpyDefault fix the full 100-case fixture soak completed clean
+  (2026-07-08) — and scored byte-identical to the host-L2 run
+  (avg_nll 0.364632982, first-token 91/100), proving the tier
+  numerically exact as well as stable. Staging-phase attribution
   (`DS4_CUDA_STREAM_STAGE_TIMING=1`, exit summary) puts the decode
   token at ~2.0 s of device-bound read time (insensitive to worker
   count 8-18 and to the page-drop hints; the real device rate for the
