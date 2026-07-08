@@ -98,6 +98,9 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
+- [ROADMAP.md](ROADMAP.md): the fork's prioritized "what next" — the ops
+  items to make the merge deployable and the performance-phase levers.
+  VOLTA.md/VALIDATION.md are its detailed backlog.
 - [VOLTA.md](VOLTA.md): this fork's V100/Volta notes — the GLM 5.2 CUDA
   port, the FP16 tensor-core GEMM path, streaming expert-cache tiers, and
   the NVLink GPU IPC transport, with measured numbers.
