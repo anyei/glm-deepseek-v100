@@ -11,8 +11,33 @@ API and integrated coding agent, all ready to work with coding agents or with
 the provided CLI interface. There are also tools for GGUF and imatrix generation,
 and for quality and speed testing.
 
+> **About this fork (`glm-deepseek-v100`).** This tree targets **NVIDIA
+> Tesla V100s** (Volta, `sm_70`, CUDA 12.9 — the last toolkit that can
+> compile for Volta), and runs **both DeepSeek V4 Flash and GLM 5.2** on
+> that hardware via SSD expert streaming. On top of upstream DwarfStar it
+> adds:
+>
+> * A **CUDA port of the GLM 5.2 kernels** (Metal-only upstream), on by
+>   default since it passed the 100-case official-continuation release
+>   gate inside the Q2 reference band (first-token 91/100, API top-1
+>   0.884, pair-order 0.801 — QA log in [VALIDATION.md](VALIDATION.md)
+>   §8). `DS4_GLM_CUDA_DISABLE=1` restores the old Metal-only refusal.
+> * **Volta performance work**: FP16 tensor-core GEMMs for FP32 matmuls
+>   on `sm_70`, layer-major batched streaming prefill, a parallel
+>   expert-miss reader pool, and two extra streaming expert-cache tiers —
+>   pinned host RAM (`DS4_CUDA_HOST_EXPERT_CACHE_GB`) and peer-GPU VRAM
+>   over NVLink (`DS4_CUDA_PEER_EXPERT_CACHE_GB`).
+> * A **same-host GPU IPC (NVLink) fast path** for distributed
+>   activations, plus a docker-compose stack for a two-V100 layer split.
+>
+> See [VOLTA.md](VOLTA.md) for the internals and measured numbers, and
+> [RUNNING.md](RUNNING.md) for the `sm_70` Docker image. The rest of this
+> README is the upstream documentation and applies unchanged unless a
+> section says otherwise.
+
 We support the following backends:
-* **Metal** is our primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
+* **NVIDIA V100 (Volta, sm_70)** is this fork's primary target: 32 GB V100s (one or two, NVLink-connected) with the models streamed from NVMe. Build with `make cuda CUDA_ARCH=sm_70` inside a CUDA 12.9 container, or use the provided Dockerfile (see [RUNNING.md](RUNNING.md)).
+* **Metal** is upstream's primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
 * **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
 * **Strix Halo (ROCm)**, systems like the Framework Desktop and other systems based on the same GPU and unified RAM design.
 
@@ -73,6 +98,15 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
+- [VOLTA.md](VOLTA.md): this fork's V100/Volta notes — the GLM 5.2 CUDA
+  port, the FP16 tensor-core GEMM path, streaming expert-cache tiers, and
+  the NVLink GPU IPC transport, with measured numbers.
+- [RUNNING.md](RUNNING.md): how to build and run the `sm_70` Docker image,
+  single-GPU and two-GPU (docker compose) setups, and the fork's
+  environment variables.
+- [VALIDATION.md](VALIDATION.md): the validation playbook and QA logs,
+  including the GLM-on-CUDA release gate (§8) and the standing
+  soak + fixture + binary-A/B recipe for runtime changes (§9).
 - [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
 - [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
@@ -139,28 +173,42 @@ but must be enabled explicitly with `--mtp`. The current MTP/speculative
 decoding path is still experimental: it is correctness-gated and currently
 provides at most a slight speedup, not a meaningful generation-speed win.
 
-GLM 5.2 support is currently limited to the GGUF files tested by this branch:
+GLM 5.2 support is currently limited to the GGUF files tested by this tree:
 
 ```sh
-./download_model.sh glm-unsloth-q4  # Unsloth UD-Q4_K_XL, 11 shards
-./download_model.sh glm-antirez-q2  # antirez routed Q2_K single-file GGUF
-./download_model.sh glm-antirez-q4  # antirez routed Q4_K single-file GGUF
+./download_model.sh glm-unsloth-q4      # Unsloth UD-Q4_K_XL, 11 shards
+./download_model.sh glm-antirez-iq2xxs  # antirez routed IQ2_XXS single-file GGUF
+./download_model.sh glm-antirez-q2      # antirez routed Q2_K single-file GGUF
+./download_model.sh glm-antirez-q4      # antirez routed Q4_K single-file GGUF
 ```
 
 The supported GLM layout keeps dense/model-control tensors in the existing
-Q8/F32 paths and supports routed expert gate/up tensors in `Q2_K`, `Q4_K`, or
-`Q5_K`; routed expert down tensors are supported in `Q2_K`, `Q4_K`, `Q5_K`, or
-`Q6_K`. Other GLM GGUF quant layouts should be treated as unsupported until they
-are added deliberately and scored against the official 100-case fixture.
+Q8/F32 paths and supports routed expert gate/up tensors in `IQ2_XXS`, `Q2_K`,
+`Q4_K`, or `Q5_K`; routed expert down tensors are supported in `Q2_K`, `Q4_K`,
+`Q5_K`, or `Q6_K`. Other GLM GGUF quant layouts should be treated as
+unsupported until they are added deliberately and scored against the official
+100-case fixture.
+
+GLM 5.2 runs on Metal and, in this fork, on CUDA: the CUDA port is on by
+default after passing the 100-case release gate on the routed-Q2_K GGUF
+(the routed-IQ2_XXS GGUF was separately validated against the CPU oracle),
+always uses SSD expert streaming, and can be disabled with
+`DS4_GLM_CUDA_DISABLE=1`. See [VOLTA.md](VOLTA.md) for the recommended
+V100 expert-cache configuration and current throughput expectations.
 
 Then build:
 
 ```sh
-make                  # macOS Metal
-make cuda-spark       # Linux CUDA, DGX Spark / GB10
-make cuda-generic     # Linux CUDA, other local CUDA GPUs
-make cpu              # CPU-only diagnostics build
+make                       # macOS Metal
+make cuda CUDA_ARCH=sm_70  # Linux CUDA, Tesla V100 (Volta) — needs CUDA 12.9
+make cuda-spark            # Linux CUDA, DGX Spark / GB10
+make cuda-generic          # Linux CUDA, other local CUDA GPUs
+make cpu                   # CPU-only diagnostics build
 ```
+
+For V100s the recommended route is the provided Dockerfile, which pins the
+CUDA 12.9 toolchain (CUDA 13.x dropped Volta) and targets `sm_70`
+explicitly; see [RUNNING.md](RUNNING.md).
 
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
@@ -1204,7 +1252,14 @@ when cross-building or when you need a known target:
 ```sh
 make cuda CUDA_ARCH=sm_120
 make cuda CUDA_ARCH=native
+make cuda CUDA_ARCH=sm_70    # Tesla V100 (Volta), CUDA 12.9 toolchain
 ```
+
+On Volta the CUDA backend automatically routes FP32 GEMMs through the FP16
+tensor cores (same trade as TF32 on newer GPUs; `--quality` or
+`DS4_CUDA_NO_FP16_GEMM=1` disables it), and GLM 5.2 models run through the
+CUDA GLM port with SSD expert streaming. [VOLTA.md](VOLTA.md) covers both in
+detail.
 
 There is also a CPU reference/debug path:
 

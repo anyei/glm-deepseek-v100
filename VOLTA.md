@@ -1,6 +1,6 @@
 # DwarfStar on NVIDIA Volta (V100, sm_70)
 
-> **glm5.2 branch note:** GLM 5.2 inference is Metal-only upstream (the
+> **Fork note:** GLM 5.2 inference is Metal-only upstream (the
 > `ds4_gpu_glm_*` kernels exist only in `ds4_metal.m`, and
 > `ds4_engine_open()` rejects GLM models on CUDA). This tree also fixes
 > the branch's CUDA and CPU builds — which upstream left broken — and
