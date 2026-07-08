@@ -791,7 +791,11 @@ static uint32_t dist_worker_forward_window(void) {
 }
 
 static bool dist_decode_profile_enabled(void) {
-    return getenv("DS4_DIST_DECODE_PROFILE") != NULL;
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = getenv("DS4_DIST_DECODE_PROFILE") != NULL;
+    }
+    return enabled != 0;
 }
 
 static bool dist_parse_positive_u32(

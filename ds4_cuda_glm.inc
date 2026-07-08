@@ -2757,7 +2757,8 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_tensor(
 }
 
 /* CUDA has no separate "direct scalar" batch variant: the generic launcher
- * already computes with the direct-dequant scalar dots, so forward. */
+ * already computes with the direct-dequant scalar dots, so this is just an
+ * alias for the plain batched entry point. */
 extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *mid,
@@ -2786,17 +2787,16 @@ extern "C" int ds4_gpu_glm_routed_moe_batch_direct_scalar_q4_tensor(
         const ds4_gpu_tensor *x,
         uint32_t                n_tokens,
         uint32_t                mid_token_stride) {
-    return glm_routed_moe_launch(out, mid, model_map, model_size,
-                                 gate_offset, up_offset, down_offset,
-                                 gate_type, up_type, down_type,
-                                 gate_expert_bytes, gate_row_bytes,
-                                 up_expert_bytes, up_row_bytes,
-                                 down_expert_bytes, down_row_bytes,
-                                 expert_in_dim, expert_mid_dim, out_dim,
-                                 selected, weights, n_total_expert, n_expert,
-                                 layer_index, x, n_tokens,
-                                 (uint64_t)mid_token_stride,
-                                 /*force_resident=*/false);
+    return ds4_gpu_glm_routed_moe_batch_tensor(
+        out, mid, model_map, model_size,
+        gate_offset, up_offset, down_offset,
+        gate_type, up_type, down_type,
+        gate_expert_bytes, gate_row_bytes,
+        up_expert_bytes, up_row_bytes,
+        down_expert_bytes, down_row_bytes,
+        expert_in_dim, expert_mid_dim, out_dim,
+        selected, weights, n_total_expert, n_expert,
+        layer_index, x, n_tokens, mid_token_stride);
 }
 
 extern "C" int ds4_gpu_glm_routed_moe_one_tensor(

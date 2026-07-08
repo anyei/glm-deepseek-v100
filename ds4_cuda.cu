@@ -1862,7 +1862,10 @@ static int cuda_stream_expert_cache_peer_alloc(
     return 1;
 }
 
-static void cuda_stream_selected_stage_release(void) {
+/* Destroy the four staging slot events/pinned buffers and reset the pool
+ * byte count. Shared by release (which also tears down the upload stream) and
+ * pool grow (which reallocates afterwards). */
+static void cuda_stream_selected_stage_free_slots(void) {
     for (size_t i = 0; i < 4; i++) {
         if (g_stream_selected_stage_event[i]) {
             (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
@@ -1875,6 +1878,10 @@ static void cuda_stream_selected_stage_release(void) {
         }
     }
     g_stream_selected_stage_bytes = 0;
+}
+
+static void cuda_stream_selected_stage_release(void) {
+    cuda_stream_selected_stage_free_slots();
     if (g_stream_selected_upload_stream) {
         (void)cudaStreamDestroy(g_stream_selected_upload_stream);
         g_stream_selected_upload_stream = NULL;
@@ -1883,18 +1890,7 @@ static void cuda_stream_selected_stage_release(void) {
 
 static int cuda_stream_selected_stage_pool_alloc(uint64_t bytes) {
     if (g_stream_selected_stage_bytes >= bytes) return 1;
-    for (size_t i = 0; i < 4; i++) {
-        if (g_stream_selected_stage_event[i]) {
-            (void)cudaEventDestroy(g_stream_selected_stage_event[i]);
-            g_stream_selected_stage_event[i] = NULL;
-        }
-        if (g_stream_selected_stage_raw[i]) {
-            (void)cudaFreeHost(g_stream_selected_stage_raw[i]);
-            g_stream_selected_stage_raw[i] = NULL;
-            g_stream_selected_stage[i] = NULL;
-        }
-    }
-    g_stream_selected_stage_bytes = 0;
+    cuda_stream_selected_stage_free_slots();
     if (!g_stream_selected_upload_stream) {
         cudaError_t err = cudaStreamCreateWithFlags(&g_stream_selected_upload_stream,
                                                     cudaStreamNonBlocking);
@@ -2514,27 +2510,16 @@ static int cuda_stream_selected_ensure_i32(
         uint64_t count,
         const char *what) {
     if (count == 0 || count > UINT64_MAX / sizeof(int32_t)) return 0;
-    const uint64_t bytes = count * sizeof(int32_t);
-    if (*ptr && *capacity >= bytes) return 1;
-    if (*ptr) {
-        (void)cudaFree(*ptr);
-        *ptr = NULL;
-        *capacity = 0;
-    }
-    void *dev = NULL;
-    cudaError_t err = cudaMalloc(&dev, (size_t)bytes);
-    if (err != cudaSuccess) {
-        fprintf(stderr,
-                "ds4: CUDA streaming selected cache allocation failed for %s (%u entries): %s\n",
-                what ? what : "selected slots",
-                (unsigned)count,
-                cudaGetErrorString(err));
-        (void)cudaGetLastError();
-        return 0;
-    }
-    *ptr = (int32_t *)dev;
-    *capacity = bytes;
-    return 1;
+    /* Same allocate-or-grow as the byte version; the int32 slot arrays just
+     * size by element count. Go through a real char* so we don't type-pun an
+     * int32_t** as char**; write back unconditionally so the on-failure
+     * NULL/zero-capacity reset still reaches the caller. */
+    char *raw = (char *)*ptr;
+    int ok = cuda_stream_selected_ensure_bytes(&raw, capacity,
+                                               count * sizeof(int32_t),
+                                               what ? what : "selected slots");
+    *ptr = (int32_t *)raw;
+    return ok;
 }
 
 static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
@@ -3896,6 +3881,22 @@ static int cuda_stream_stage_timing_enabled(void) {
     return g_stream_stage_timing.enabled;
 }
 
+/* Accumulate elapsed ms since *stage_t into *field and advance *stage_t.
+ * No-op when timing is off. */
+static inline void cuda_stream_stage_lap(int on, double *stage_t, double *field) {
+    if (!on) return;
+    const double now = cuda_wall_sec();
+    *field += (now - *stage_t) * 1000.0;
+    *stage_t = now;
+}
+
+/* Cached: this env var is read on the per-layer staging path. */
+static int cuda_stream_expert_cache_verbose(void) {
+    static int v = -1;
+    if (v == -1) v = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE") != NULL;
+    return v;
+}
+
 static int cuda_stream_selected_cache_begin_compact_load(
         const void    *model_map,
         uint64_t       model_size,
@@ -4254,11 +4255,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
-    if (stage_timing) {
-        const double now = cuda_wall_sec();
-        g_stream_stage_timing.io_ms += (now - stage_t) * 1000.0;
-        stage_t = now;
-    }
+    cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.io_ms);
 
     /* Batch landed: account appended slots and mirror each filled slot into
      * its compact position. */
@@ -4280,11 +4277,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
-    if (stage_timing) {
-        const double now = cuda_wall_sec();
-        g_stream_stage_timing.mirror_ms += (now - stage_t) * 1000.0;
-        stage_t = now;
-    }
+    cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.mirror_ms);
 
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids,
@@ -4294,10 +4287,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
         cuda_stream_selected_cache_invalidate();
         return strict_failure ? 0 : 1;
     }
-    if (stage_timing) {
-        g_stream_stage_timing.upload_ms +=
-            (cuda_wall_sec() - stage_t) * 1000.0;
-    }
+    cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.upload_ms);
 
     g_stream_selected_cache.model_map = model_map;
     g_stream_selected_cache.layer = layer;
@@ -4317,7 +4307,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.valid = 1;
 
-    if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
+    if (cuda_stream_expert_cache_verbose()) {
         cuda_model_load_progress_finish();
         fprintf(stderr,
                 "ds4: CUDA streaming selected layer=%u slots=%u compact=%u global_budget=%u before=%u after=%u hits=%u misses=%u host=%u direct=%u gate/up %.2f MiB down %.2f MiB\n",
@@ -4556,7 +4546,7 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
             return 1;
         }
     }
-    if (getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE")) {
+    if (cuda_stream_expert_cache_verbose()) {
         fprintf(stderr,
                 "ds4: CUDA streaming hotlist seeded layer=%u requested=%u cached=%u cap=%u\n",
                 layer,
