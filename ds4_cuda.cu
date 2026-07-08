@@ -2084,10 +2084,13 @@ static void cuda_stream_read_worker(void) {
             }
         }
         if (ok) {
+            /* cudaMemcpyDefault: destinations can be peer-device expert
+             * slots; let UVA resolve the direction rather than mislabel
+             * a cross-device copy as HostToDevice. */
             ok = cudaMemcpyAsync(item.dst,
                                  payload,
                                  (size_t)item.bytes,
-                                 cudaMemcpyHostToDevice,
+                                 cudaMemcpyDefault,
                                  g_stream_read_upload_stream) == cudaSuccess;
             if (!ok) (void)cudaGetLastError();
         }
@@ -2969,10 +2972,12 @@ static int cuda_model_copy_to_device_streamed(
                     strerror(errno));
             return 0;
         }
+        /* dst can be a peer-device expert slot (seed/serial fallback paths);
+         * cudaMemcpyDefault lets UVA pick the real direction. */
         err = cudaMemcpyAsync(dst + copied,
                               payload,
                               (size_t)n,
-                              cudaMemcpyHostToDevice,
+                              cudaMemcpyDefault,
                               g_stream_selected_upload_stream);
         if (err != cudaSuccess) {
             fprintf(stderr,
@@ -13502,8 +13507,10 @@ static int glm_routed_moe_launch(
         bool force_resident);
 
 static int cuda_glm_experimental_mode(void) {
+    /* GLM on CUDA is validated and on by default (see the engine-open gate
+     * in ds4.c); DS4_GLM_CUDA_DISABLE restores the old refusal. */
     static int cached = -1;
-    if (cached < 0) cached = getenv("DS4_GLM_CUDA_EXPERIMENTAL") != NULL ? 1 : 0;
+    if (cached < 0) cached = getenv("DS4_GLM_CUDA_DISABLE") == NULL ? 1 : 0;
     return cached;
 }
 

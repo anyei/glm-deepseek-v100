@@ -35,7 +35,9 @@ Models used throughout:
   and verify the binary content.
 - Benchmarks need the GPU and its VRAM to themselves: stop any production
   inference containers first, restart them after.
-- GLM on CUDA is gated: every GLM run needs `DS4_GLM_CUDA_EXPERIMENTAL=1`.
+- GLM on CUDA is on by default since the §8 gate passed;
+  `DS4_GLM_CUDA_EXPERIMENTAL=1` in older commands is harmless. On trees
+  from before the gate removal it is still required.
 
 ## 1. Build gates
 
@@ -233,9 +235,23 @@ a regression):
 -e DS4_CUDA_WEIGHT_CACHE_VERBOSE=1
 ```
 
-## 8. Release gate (before removing the EXPERIMENTAL flag)
+## 8. Release gate — PASSED 2026-07-08
 
-The full 100-case official continuation fixture
-(`tests/`, see QA_BEFORE_RELEASES.md) must pass on the CUDA path before
-`DS4_GLM_CUDA_EXPERIMENTAL` and the startup WARNING are removed. §2-§6
-are per-change gates; this one is the ship gate.
+The 100-case official continuation fixture
+(`gguf-tools/quality-testing/`, see QA_BEFORE_RELEASES.md) passed on the
+CUDA path, so `DS4_GLM_CUDA_EXPERIMENTAL` and the startup WARNING were
+removed (GLM on CUDA is now on by default; `DS4_GLM_CUDA_DISABLE`
+restores the refusal). §2-§6 remain the per-change gates.
+
+QA log — Q2 routed GGUF, CUDA + SSD streaming (26 GB expert budget +
+28 GB host L2), reference band: first-token ~92/100, top-1 ~0.890,
+pair-order ~0.800:
+
+```
+summary cases=100 tokens=2299 avg_nll=0.364632982 first_match=91 avg_lcp=7.500
+api_summary ref_tokens=2294 target_tokens=2223 target_mae=0.305695700 target_mean_delta=-0.268561479 top_items=44460 top_mapped=44357 top_coverage=0.997683311 top1_match=1965/2223 top1_rate=0.883940621 topn_hit=32806/44357 topn_recall=0.739590144 top_logprob_count=44357 top_mae=1.849234104 top_mean_delta=0.966769438 pair_agree=331692/414321 pair_rate=0.800567676
+```
+
+Scorer build on Linux: `make gguf-tools/quality-testing/score_official
+CUDA_ARCH=sm_70` (inside the CUDA 12.9 devel image; the rule links with
+nvcc). Run from the repo root so the manifest's relative paths resolve.

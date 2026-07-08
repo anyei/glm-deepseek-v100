@@ -38739,24 +38739,23 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
             *out = e;
             return 0;
         }
-        const bool glm_cuda_experimental =
+        /* GLM on CUDA is validated: first-token logits match the CPU
+         * reference (top-8 identical, max delta 0.036) and the 100-case
+         * official-continuation fixture scores inside the Q2 reference
+         * band (first-token 91/100, API top-1 0.884, pair-order 0.801).
+         * DS4_GLM_CUDA_DISABLE restores the old Metal-only refusal. */
+        const bool glm_cuda_enabled =
             e->backend == DS4_BACKEND_CUDA &&
-            getenv("DS4_GLM_CUDA_EXPERIMENTAL") != NULL;
-        if ((e->backend != DS4_BACKEND_METAL && !glm_cuda_experimental) ||
+            getenv("DS4_GLM_CUDA_DISABLE") == NULL;
+        if ((e->backend != DS4_BACKEND_METAL && !glm_cuda_enabled) ||
             !ds4_backend_uses_graph(e->backend)) {
             fprintf(stderr,
-                    "ds4: GLM 5.2 tensor layout is recognized, but GLM inference is "
-                    "currently Metal-only; use --inspect, --cpu --first-token-test, "
-                    "--metal --metal-graph-test, or limited --metal generation "
-                    "(set DS4_GLM_CUDA_EXPERIMENTAL=1 to try the in-progress CUDA port)\n");
+                    "ds4: GLM 5.2 tensor layout is recognized, but GLM inference "
+                    "needs the Metal or CUDA graph backend; use --inspect, "
+                    "--cpu --first-token-test, or a graph-backend build\n");
             ds4_engine_close(e);
             *out = NULL;
             return 1;
-        }
-        if (glm_cuda_experimental) {
-            fprintf(stderr,
-                    "ds4: WARNING: GLM on CUDA is an experimental in-progress port; "
-                    "outputs are not yet validated\n");
         }
 #ifndef DS4_NO_GPU
         if (opt->context_size > 0) {

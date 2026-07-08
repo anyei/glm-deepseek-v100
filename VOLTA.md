@@ -4,9 +4,10 @@
 > `ds4_gpu_glm_*` kernels exist only in `ds4_metal.m`, and
 > `ds4_engine_open()` rejects GLM models on CUDA). This tree also fixes
 > the branch's CUDA and CPU builds — which upstream left broken — and
-> adds a **working CUDA port of the GLM kernels**, gated behind
-> `DS4_GLM_CUDA_EXPERIMENTAL=1` and numerically validated against the
-> CPU reference (see "GLM 5.2 CUDA port" below). The distributed GPU
+> adds a **working CUDA port of the GLM kernels**, on by default and
+> validated against both the CPU reference and the 100-case official
+> continuation fixture (see "GLM 5.2 CUDA port" below;
+> `DS4_GLM_CUDA_DISABLE=1` opts out). The distributed GPU
 > IPC fast path still declines GLM sessions (host-pointer chunked eval)
 > and falls back to TCP automatically.
 
@@ -84,11 +85,12 @@ mount: top-8 tokens identical in identical order (argmax
 logit rms 7.151 vs 7.158 — within f32 reduction-order noise. Q2 GLM
 generation and DeepSeek regressions still pass.
 
-Running it (gated while the performance work is in progress):
+Running it (on by default since the release gate passed;
+`DS4_GLM_CUDA_DISABLE=1` restores the Metal-only refusal):
 
 ```sh
-DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
-  --cuda --ssd-streaming --ssd-streaming-cache-experts 8GB \
+./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 26GB \
   --ctx 1024 -p "hello"
 ```
 
@@ -151,9 +153,11 @@ DS4_GLM_CUDA_EXPERIMENTAL=1 ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
 - The optional fast-path kernels (flash, staged KV, batched attention,
   split-group8 decode) are still stubs — the caps mask routes to scalar
   equivalents.
-- Broader validation: one prompt on IQ2_XXS (plus Q2 generation spot
-  checks) so far; the 100-case official fixture should gate before the
-  `DS4_GLM_CUDA_EXPERIMENTAL` gate and the startup WARNING are removed.
+- Validation: first-token logits match the CPU oracle (IQ2_XXS), and
+  the 100-case official continuation fixture passes on CUDA inside the
+  Q2 reference band (first-token 91/100, API top-1 0.884, pair-order
+  0.801 — QA log in VALIDATION.md §8). The EXPERIMENTAL gate and the
+  startup WARNING are removed accordingly.
 - Distributed: GPU IPC / distributed sessions still decline GLM and
   fall back to TCP or single-GPU.
 
