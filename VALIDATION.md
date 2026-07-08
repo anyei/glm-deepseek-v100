@@ -255,3 +255,45 @@ api_summary ref_tokens=2294 target_tokens=2223 target_mae=0.305695700 target_mea
 Scorer build on Linux: `make gguf-tools/quality-testing/score_official
 CUDA_ARCH=sm_70` (inside the CUDA 12.9 devel image; the rule links with
 nvcc). Run from the repo root so the manifest's relative paths resolve.
+
+## 9. Change-validation strategy: soak + fixture + binary A/B
+
+The reusable recipe for any nontrivial streaming/runtime change,
+composed of three machine-time-only steps (first used 2026-07-08 to
+gate the peer-cache fix and the main fast-forward):
+
+1. **Soak** — run the full 100-case fixture with the new feature
+   enabled. It is ~10x longer than any benchmark run and catches what
+   short runs miss (the peer-tier hang appeared only ~8 minutes into
+   sustained load). Arm a watchdog on the output TSV's mtime: no new
+   case row for >12 minutes while the container is up = stall; capture
+   thread stacks before killing (`docker run --pid=container:<name>
+   --cap-add=SYS_PTRACE ... gdb -p <pid> -batch -ex 'thread apply all
+   bt'`).
+2. **Fixture scoring** — the same run doubles as a quality datapoint
+   for the affected model family; compare against the recorded band
+   (§8 for GLM Q2) or the baseline below for Flash.
+3. **Binary A/B** — for changes that should not alter numerics
+   (IO plumbing, caching, scheduling), score the SAME model + manifest
+   with the old binary (build it from the pre-change ref in a separate
+   worktree) and the new one, then:
+   `python3 gguf-tools/quality-testing/compare_scores.py old.tsv new.tsv`
+   — the delta must be ~0. This turns "no documented reference band"
+   into a non-issue and is the merge gate for forwarding shared
+   improvements to another branch (e.g. glm5.2 -> main).
+
+DeepSeek Flash IQ2XXS baseline (recorded 2026-07-08, glm5.2 tree,
+26 GiB expert budget, no L2):
+
+```
+summary cases=100 tokens=2289 avg_nll=0.404643735 first_match=64 avg_lcp=6.750
+api_summary ref_tokens=2289 target_tokens=2289 target_mae=0.404643735 target_mean_delta=-0.404643735 top_items=11445 top_mapped=9484 top_coverage=0.828658803 top1_match=1979/2289 top1_rate=0.864569681 topn_hit=3014/9484 topn_recall=0.317798397 top_logprob_count=9484 top_mae=7567.322662597 top_mean_delta=7567.127337943 pair_agree=7133/7207 pair_rate=0.989732205
+```
+
+Caveat for the flash fixture set: its stored top-logprobs carry
+placeholder values (5 alternatives/token, 83% mapping coverage), so
+`api_top_mae`/`api_top_mean_delta` are meaningless there — judge Flash
+by `avg_nll`, `first_match`, `top1_rate`, and the ordering-based
+`pair_rate`, or better, by the binary A/B above. main predates the
+Linux scorer rule; when building the old binary from refs before
+98fb7a7, append the §8 link rule to the build copy's Makefile.
