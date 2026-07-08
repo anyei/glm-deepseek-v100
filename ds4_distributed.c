@@ -14,6 +14,7 @@
  */
 
 #include "ds4_distributed.h"
+#include "ds4_gpu.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -51,14 +52,19 @@
 #define DS4_DIST_MSG_SNAPSHOT_CHUNK 7u
 #define DS4_DIST_MSG_SNAPSHOT_DONE 8u
 #define DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN 9u
+#define DS4_DIST_MSG_IPC_INBOX 10u
 #define DS4_DIST_MAX_MODEL_NAME 127u
 #define DS4_DIST_WORK_F_INPUT_HC 0x00000001u
 #define DS4_DIST_WORK_F_OUTPUT_LOGITS 0x00000002u
 #define DS4_DIST_WORK_F_RESET_SESSION 0x00000004u
 #define DS4_DIST_WORK_F_ACK_ONLY 0x00000008u
+#define DS4_DIST_WORK_F_INPUT_HC_IPC 0x00000010u
 #define DS4_DIST_WORK_F_VALID_MASK \
     (DS4_DIST_WORK_F_INPUT_HC | DS4_DIST_WORK_F_OUTPUT_LOGITS | \
-     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY)
+     DS4_DIST_WORK_F_RESET_SESSION | DS4_DIST_WORK_F_ACK_ONLY | \
+     DS4_DIST_WORK_F_INPUT_HC_IPC)
+#define DS4_DIST_IPC_MAX_SLOTS 8u
+#define DS4_DIST_IPC_DESC_BYTES 8u
 #define DS4_DIST_RESULT_ACK 0u
 #define DS4_DIST_RESULT_HIDDEN_STATE 1u
 #define DS4_DIST_RESULT_LOGITS 2u
@@ -151,6 +157,35 @@ typedef struct {
     uint32_t output_bytes;
 } ds4_dist_telemetry_fixed;
 
+/* Same-host GPU IPC activation transport.
+ *
+ * A receiver of distributed activations owns one process-global "inbox":
+ * a device buffer of slot_count fixed-size slots plus one interprocess
+ * event per slot. The inbox is advertised over TCP (DS4_DIST_MSG_IPC_INBOX,
+ * sent by workers right after HELLO and in reply to a query on forward
+ * connections). A sender that can open the advertised handles maps the
+ * inbox and, instead of shipping the hidden state in the WORK frame, has
+ * its engine write it device-to-device (NVLink/P2P) into a slot and sends
+ * an 8-byte {slot, bytes} descriptor. The receiver's engine records the
+ * slot event after consuming it; the sender waits on that event before
+ * reusing the slot. Any negotiation or mapping failure falls back to the
+ * TCP payload per frame; DS4_DIST_NO_IPC=1 disables the whole path. */
+typedef struct ds4_dist_ipc_link {
+    void *mapped;
+    void *events[DS4_DIST_IPC_MAX_SLOTS];
+    uint32_t slot_count;
+    uint64_t slot_bytes;
+    uint32_t next_slot;
+    pthread_mutex_t mu;
+} ds4_dist_ipc_link;
+
+typedef struct {
+    uint32_t slot_count; /* 0 = query / not available */
+    uint64_t slot_bytes;
+    uint8_t mem_handle[DS4_GPU_IPC_HANDLE_BYTES];
+    uint8_t evt_handles[DS4_DIST_IPC_MAX_SLOTS][DS4_GPU_IPC_HANDLE_BYTES];
+} ds4_dist_ipc_advert;
+
 typedef struct {
     uint32_t model_id;
     uint32_t session_hi;
@@ -219,6 +254,10 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
+    /* Mapped GPU IPC inbox of this worker, or NULL. Deliberately never
+     * freed on disconnect: in-flight route plans may still reference it
+     * and a stale mapping is tiny (a few MiB per reconnect cycle). */
+    ds4_dist_ipc_link *ipc;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
 
@@ -299,6 +338,7 @@ typedef struct ds4_dist_worker_forwarder {
     uint32_t pending_count;
     uint32_t pending_depth;
     bool closing;
+    ds4_dist_ipc_link *ipc;
     struct ds4_dist_worker_forwarder *next;
 } ds4_dist_worker_forwarder;
 
@@ -351,6 +391,7 @@ typedef struct {
     uint32_t layer_end;
     uint32_t flags;
     int fd;
+    ds4_dist_ipc_link *ipc; /* in-memory only; never serialized to the route blob */
 } ds4_dist_route_entry;
 
 typedef struct {
@@ -1172,6 +1213,285 @@ static int dist_send_error(int fd, const char *msg) {
     return dist_write_full(fd, msg, len);
 }
 
+/* =========================================================================
+ * Same-Host GPU IPC Activation Transport
+ * ========================================================================= */
+
+/* IPC_INBOX wire payload: u32 slot_count, u32 slot_bytes_hi, u32
+ * slot_bytes_lo (network order), then for slot_count > 0 the 64-byte
+ * memory handle and slot_count 64-byte event handles (opaque bytes).
+ * slot_count == 0 is both the "please advertise" query and the "no inbox
+ * available" reply. */
+
+static int dist_ipc_write_advert(int fd, const ds4_dist_ipc_advert *adv) {
+    uint32_t head[3];
+    const uint32_t count = adv ? adv->slot_count : 0u;
+    const uint64_t slot_bytes = adv ? adv->slot_bytes : 0u;
+    head[0] = htonl(count);
+    head[1] = htonl((uint32_t)(slot_bytes >> 32));
+    head[2] = htonl((uint32_t)(slot_bytes & 0xffffffffu));
+    const uint32_t payload = (uint32_t)sizeof(head) +
+        (count ? (1u + count) * DS4_GPU_IPC_HANDLE_BYTES : 0u);
+    if (dist_write_frame_header(fd, DS4_DIST_MSG_IPC_INBOX, payload) != 0) return -1;
+    if (dist_write_full(fd, head, sizeof(head)) != 0) return -1;
+    if (count) {
+        if (dist_write_full(fd, adv->mem_handle, DS4_GPU_IPC_HANDLE_BYTES) != 0) return -1;
+        if (dist_write_full(fd, adv->evt_handles,
+                            (size_t)count * DS4_GPU_IPC_HANDLE_BYTES) != 0) return -1;
+    }
+    return 0;
+}
+
+/* Reads an IPC_INBOX payload of frame_bytes into *adv. Returns 1 on
+ * success, 0 on clean EOF, -1 on protocol/transport error. */
+static int dist_ipc_read_advert_payload(int fd, uint32_t frame_bytes,
+                                        ds4_dist_ipc_advert *adv) {
+    uint32_t head[3];
+    if (frame_bytes < sizeof(head)) return -1;
+    int rc = dist_read_full(fd, head, sizeof(head));
+    if (rc <= 0) return rc;
+    memset(adv, 0, sizeof(*adv));
+    adv->slot_count = ntohl(head[0]);
+    adv->slot_bytes = ((uint64_t)ntohl(head[1]) << 32) | ntohl(head[2]);
+    if (adv->slot_count == 0) {
+        return frame_bytes == sizeof(head) ? 1 : -1;
+    }
+    if (adv->slot_count > DS4_DIST_IPC_MAX_SLOTS || adv->slot_bytes == 0) return -1;
+    const uint32_t expected = (uint32_t)sizeof(head) +
+        (1u + adv->slot_count) * DS4_GPU_IPC_HANDLE_BYTES;
+    if (frame_bytes != expected) return -1;
+    rc = dist_read_full(fd, adv->mem_handle, DS4_GPU_IPC_HANDLE_BYTES);
+    if (rc <= 0) return rc;
+    rc = dist_read_full(fd, adv->evt_handles,
+                        (size_t)adv->slot_count * DS4_GPU_IPC_HANDLE_BYTES);
+    return rc <= 0 ? rc : 1;
+}
+
+#ifndef DS4_NO_GPU
+
+/* Every distributed thread that can reach GPU work (session evals, IPC
+ * handle opens, slot-event records) must bind to the process's CUDA
+ * device first: device selection is per-thread and DS4_CUDA_DEVICE only
+ * binds the thread that ran ds4_gpu_init(). */
+static void dist_gpu_bind_thread(void) {
+    ds4_gpu_bind_thread_device();
+}
+
+static bool dist_ipc_enabled(void) {
+    static int enabled = -1;
+    if (enabled == -1) {
+        enabled = getenv("DS4_DIST_NO_IPC") == NULL &&
+                  ds4_gpu_dist_ipc_supported();
+    }
+    return enabled != 0;
+}
+
+static uint32_t dist_ipc_slot_count_config(void) {
+    const char *s = getenv("DS4_DIST_IPC_SLOTS");
+    long v = s ? strtol(s, NULL, 10) : 4;
+    if (v < 1) v = 1;
+    if (v > (long)DS4_DIST_IPC_MAX_SLOTS) v = DS4_DIST_IPC_MAX_SLOTS;
+    return (uint32_t)v;
+}
+
+static uint64_t dist_ipc_slot_bytes_config(void) {
+    const char *s = getenv("DS4_DIST_IPC_SLOT_BYTES");
+    long long v = s ? strtoll(s, NULL, 10) : 1048576;
+    if (v < 65536) v = 65536;
+    return (uint64_t)v;
+}
+
+/* Process-global receive inbox, created lazily on first advertisement. */
+static struct {
+    pthread_mutex_t mu;
+    bool attempted;
+    void *dev;
+    void *events[DS4_DIST_IPC_MAX_SLOTS];
+    ds4_dist_ipc_advert adv;
+} g_dist_ipc_inbox = { PTHREAD_MUTEX_INITIALIZER, false, NULL, {0}, {{0}} };
+
+/* Returns the advert for the local inbox (slot_count 0 if unavailable). */
+static const ds4_dist_ipc_advert *dist_ipc_local_inbox(void) {
+    pthread_mutex_lock(&g_dist_ipc_inbox.mu);
+    if (!g_dist_ipc_inbox.attempted && dist_ipc_enabled()) {
+        g_dist_ipc_inbox.attempted = true;
+        const uint32_t count = dist_ipc_slot_count_config();
+        const uint64_t slot_bytes = dist_ipc_slot_bytes_config();
+        g_dist_ipc_inbox.dev = ds4_gpu_dist_ipc_inbox_create(
+                (uint64_t)count * slot_bytes,
+                count,
+                g_dist_ipc_inbox.adv.mem_handle,
+                g_dist_ipc_inbox.adv.evt_handles,
+                g_dist_ipc_inbox.events);
+        if (g_dist_ipc_inbox.dev) {
+            g_dist_ipc_inbox.adv.slot_count = count;
+            g_dist_ipc_inbox.adv.slot_bytes = slot_bytes;
+            fprintf(stderr,
+                    "ds4: distributed: GPU IPC inbox ready (%u slots x %llu KiB)\n",
+                    count, (unsigned long long)(slot_bytes / 1024));
+        } else {
+            fprintf(stderr,
+                    "ds4: distributed: GPU IPC inbox unavailable, using TCP activations\n");
+        }
+    }
+    pthread_mutex_unlock(&g_dist_ipc_inbox.mu);
+    return &g_dist_ipc_inbox.adv;
+}
+
+static void *dist_ipc_local_slot_ptr(uint32_t slot) {
+    if (!g_dist_ipc_inbox.dev || slot >= g_dist_ipc_inbox.adv.slot_count) return NULL;
+    return (char *)g_dist_ipc_inbox.dev + (uint64_t)slot * g_dist_ipc_inbox.adv.slot_bytes;
+}
+
+static void *dist_ipc_local_slot_event(uint32_t slot) {
+    if (slot >= g_dist_ipc_inbox.adv.slot_count) return NULL;
+    return g_dist_ipc_inbox.events[slot];
+}
+
+static bool dist_ipc_local_inbox_ready(void) {
+    return g_dist_ipc_inbox.dev != NULL;
+}
+
+/* Maps a peer's advertised inbox. NULL means "use TCP" (different host,
+ * mapping failure, or a 0-slot advert). */
+static ds4_dist_ipc_link *dist_ipc_link_open(const ds4_dist_ipc_advert *adv) {
+    if (!adv || adv->slot_count == 0 || adv->slot_count > DS4_DIST_IPC_MAX_SLOTS ||
+        !dist_ipc_enabled()) {
+        return NULL;
+    }
+    void *mapped = ds4_gpu_dist_ipc_open_mem(adv->mem_handle);
+    if (!mapped) return NULL;
+    ds4_dist_ipc_link *link = calloc(1, sizeof(*link));
+    if (!link) {
+        ds4_gpu_dist_ipc_close_mem(mapped);
+        return NULL;
+    }
+    link->mapped = mapped;
+    link->slot_count = adv->slot_count;
+    link->slot_bytes = adv->slot_bytes;
+    pthread_mutex_init(&link->mu, NULL);
+    for (uint32_t i = 0; i < adv->slot_count; i++) {
+        link->events[i] = ds4_gpu_dist_ipc_open_event(adv->evt_handles[i]);
+        if (!link->events[i]) {
+            for (uint32_t j = 0; j < i; j++) ds4_gpu_dist_ipc_close_event(link->events[j]);
+            ds4_gpu_dist_ipc_close_mem(mapped);
+            pthread_mutex_destroy(&link->mu);
+            free(link);
+            return NULL;
+        }
+    }
+    fprintf(stderr,
+            "ds4: distributed: GPU IPC activation path enabled (%u slots x %llu KiB)\n",
+            link->slot_count, (unsigned long long)(link->slot_bytes / 1024));
+    return link;
+}
+
+static void dist_ipc_link_free(ds4_dist_ipc_link *link) {
+    if (!link) return;
+    for (uint32_t i = 0; i < link->slot_count; i++) {
+        ds4_gpu_dist_ipc_close_event(link->events[i]);
+    }
+    ds4_gpu_dist_ipc_close_mem(link->mapped);
+    pthread_mutex_destroy(&link->mu);
+    free(link);
+}
+
+/* Round-robin slot acquisition with event-based flow control. Returns the
+ * slot index, or -1 when the payload does not fit or the wait fails (the
+ * caller falls back to the TCP payload). */
+static int dist_ipc_link_acquire_slot(ds4_dist_ipc_link *link, uint64_t bytes) {
+    if (!link || bytes == 0 || bytes > link->slot_bytes) return -1;
+    pthread_mutex_lock(&link->mu);
+    const uint32_t slot = link->next_slot;
+    link->next_slot = (link->next_slot + 1u) % link->slot_count;
+    pthread_mutex_unlock(&link->mu);
+    if (!ds4_gpu_dist_ipc_event_wait(link->events[slot])) return -1;
+    return (int)slot;
+}
+
+static void *dist_ipc_link_slot_ptr(const ds4_dist_ipc_link *link, int slot) {
+    if (!link || slot < 0 || (uint32_t)slot >= link->slot_count) return NULL;
+    return (char *)link->mapped + (uint64_t)slot * link->slot_bytes;
+}
+
+#else /* DS4_NO_GPU */
+
+static void dist_gpu_bind_thread(void) {}
+static bool dist_ipc_enabled(void) { return false; }
+static const ds4_dist_ipc_advert *dist_ipc_local_inbox(void) {
+    static const ds4_dist_ipc_advert none = {0};
+    return &none;
+}
+static void *dist_ipc_local_slot_ptr(uint32_t slot) { (void)slot; return NULL; }
+static void *dist_ipc_local_slot_event(uint32_t slot) { (void)slot; return NULL; }
+static bool dist_ipc_local_inbox_ready(void) { return false; }
+static ds4_dist_ipc_link *dist_ipc_link_open(const ds4_dist_ipc_advert *adv) {
+    (void)adv;
+    return NULL;
+}
+static void dist_ipc_link_free(ds4_dist_ipc_link *link) { (void)link; }
+static int dist_ipc_link_acquire_slot(ds4_dist_ipc_link *link, uint64_t bytes) {
+    (void)link; (void)bytes;
+    return -1;
+}
+static void *dist_ipc_link_slot_ptr(const ds4_dist_ipc_link *link, int slot) {
+    (void)link; (void)slot;
+    return NULL;
+}
+
+#endif /* DS4_NO_GPU */
+
+/* Coordinator side: right after a validated HELLO the worker may send its
+ * inbox advert. Waits up to timeout_ms; returns the mapped link or NULL.
+ * Always drains the frame even when IPC is locally disabled so the advert
+ * cannot poison the control stream. */
+static ds4_dist_ipc_link *dist_ipc_read_advert_link(int fd, int timeout_ms) {
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int prc = poll(&pfd, 1, timeout_ms);
+    if (prc <= 0 || (pfd.revents & POLLIN) == 0) return NULL;
+    uint32_t type = 0, bytes = 0;
+    char err[128];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) <= 0) return NULL;
+    if (type != DS4_DIST_MSG_IPC_INBOX) {
+        /* Nothing else is legal here; drain and ignore. */
+        (void)dist_discard_bytes(fd, bytes);
+        return NULL;
+    }
+    ds4_dist_ipc_advert adv;
+    if (dist_ipc_read_advert_payload(fd, bytes, &adv) <= 0) return NULL;
+    return dist_ipc_link_open(&adv);
+}
+
+/* Forward-hop sender side: query the peer worker for its inbox on a fresh
+ * worker-to-worker connection (before the relay thread starts reading). */
+static ds4_dist_ipc_link *dist_ipc_query_peer_link(int fd) {
+    if (!dist_ipc_enabled()) return NULL;
+    if (dist_ipc_write_advert(fd, NULL) != 0) return NULL;
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    ds4_dist_ipc_link *link = NULL;
+    uint32_t type = 0, bytes = 0;
+    char err[128];
+    if (dist_read_frame_header(fd, &type, &bytes, err, sizeof(err)) > 0 &&
+        type == DS4_DIST_MSG_IPC_INBOX) {
+        ds4_dist_ipc_advert adv;
+        if (dist_ipc_read_advert_payload(fd, bytes, &adv) > 0) {
+            link = dist_ipc_link_open(&adv);
+        }
+    }
+    tv.tv_sec = 0;
+    tv.tv_usec = 0;
+    (void)setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return link;
+}
+
+/* Builds the 8-byte IPC descriptor that replaces the activation payload. */
+static void dist_ipc_desc_build(uint32_t slot, uint32_t hc_f32_bytes,
+                                uint32_t desc[2]) {
+    desc[0] = htonl(slot);
+    desc[1] = htonl(hc_f32_bytes);
+}
+
 static void dist_peer_name(int fd, char *host, size_t hostlen, char *port, size_t portlen) {
     if (hostlen) host[0] = '\0';
     if (portlen) port[0] = '\0';
@@ -1859,7 +2179,8 @@ static void dist_coordinator_add_worker(
         const char *peer_host,
         const char *peer_port,
         const ds4_dist_hello_fixed *hello,
-        const char *model_name) {
+        const char *model_name,
+        ds4_dist_ipc_link *ipc) {
     ds4_dist_worker_entry *entry = calloc(1, sizeof(*entry));
     if (!entry) {
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: out of memory while registering worker\n");
@@ -1867,6 +2188,7 @@ static void dist_coordinator_add_worker(
     }
 
     entry->fd = fd;
+    entry->ipc = ipc;
     snprintf(entry->peer_host, sizeof(entry->peer_host), "%s", peer_host);
     snprintf(entry->peer_port, sizeof(entry->peer_port), "%s", peer_port);
     snprintf(entry->model_name, sizeof(entry->model_name), "%s", model_name ? model_name : "unknown");
@@ -2268,6 +2590,7 @@ static bool dist_coordinator_build_route_plan(
         entry.layer_start = w->layer_start;
         entry.layer_end = w->layer_end;
         entry.flags = w->has_output ? DS4_DIST_ROUTE_F_OUTPUT_LOGITS : 0u;
+        entry.ipc = w->ipc;
         if (state->use_control_for_work && plan->count == 0) {
             entry.fd = dup(w->fd);
             if (entry.fd < 0) {
@@ -2505,6 +2828,7 @@ static int dist_coordinator_send_remote_work_on_fd(
         bool ack_only,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
+        int ipc_slot,
         char *err,
         size_t errlen) {
     if (plan->count == 0) {
@@ -2530,16 +2854,28 @@ static int dist_coordinator_send_remote_work_on_fd(
     if ((first->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         work.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
     }
-    uint32_t wire_hidden_hc_bytes = 0;
-    if (!dist_activation_wire_bytes_from_f32_bytes(state->activation_bits,
-                                                   hidden_hc_bytes,
-                                                   &wire_hidden_hc_bytes)) {
-        if (errlen) snprintf(err, errlen, "invalid distributed hidden-state size");
-        return 1;
+    uint32_t ipc_desc[2];
+    if (ipc_slot >= 0 && hidden_hc_bytes != 0) {
+        /* The hidden state is already in the peer's GPU inbox slot; ship
+         * only the {slot, bytes} descriptor. Descriptors are always full
+         * FP32 sizes (activation-bit quantization does not apply). */
+        dist_ipc_desc_build((uint32_t)ipc_slot, hidden_hc_bytes, ipc_desc);
+        work.flags |= DS4_DIST_WORK_F_INPUT_HC_IPC;
+        work.input_hc_bytes = DS4_DIST_IPC_DESC_BYTES;
+        work.input_hc_bits = 32u;
+        hidden_hc = (const float *)ipc_desc;
+    } else {
+        uint32_t wire_hidden_hc_bytes = 0;
+        if (!dist_activation_wire_bytes_from_f32_bytes(state->activation_bits,
+                                                       hidden_hc_bytes,
+                                                       &wire_hidden_hc_bytes)) {
+            if (errlen) snprintf(err, errlen, "invalid distributed hidden-state size");
+            return 1;
+        }
+        work.input_hc_bytes = wire_hidden_hc_bytes;
+        work.input_hc_bits = state->activation_bits;
     }
     work.token_bytes = n_tokens * sizeof(uint32_t);
-    work.input_hc_bytes = wire_hidden_hc_bytes;
-    work.input_hc_bits = state->activation_bits;
     work.route_count = plan->count;
     work.route_index = 0;
     work.route_bytes = plan->blob_bytes;
@@ -2566,6 +2902,7 @@ static int dist_coordinator_eval_remote_on_fd(
         bool reset_session,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
+        int ipc_slot,
         float *logits,
         char *err,
         size_t errlen) {
@@ -2586,6 +2923,7 @@ static int dist_coordinator_eval_remote_on_fd(
                                                      false,
                                                      hidden_hc,
                                                      hidden_hc_bytes,
+                                                     ipc_slot,
                                                      err,
                                                      errlen);
     const double send_t1 = profile ? dist_now_sec() : 0.0;
@@ -2729,6 +3067,22 @@ static int dist_coordinator_eval_span(
         }
     }
 
+    /* Same-host fast path: when the first hop advertised a GPU IPC inbox
+     * and the hidden state fits a slot, have the local eval write it
+     * straight into the peer's GPU (NVLink/P2P) and ship only a slot
+     * descriptor. Any failure here silently keeps the TCP path (the host
+     * `hidden` buffer is then filled as usual). */
+    int ipc_slot = -1;
+    if (plan->count != 0 && !local_logits && plan->entry[0].ipc) {
+        ipc_slot = dist_ipc_link_acquire_slot(plan->entry[0].ipc, hidden_bytes64);
+        if (ipc_slot >= 0 &&
+            !ds4_session_layer_slice_device_io(
+                    session, NULL, NULL,
+                    dist_ipc_link_slot_ptr(plan->entry[0].ipc, ipc_slot))) {
+            ipc_slot = -1;
+        }
+    }
+
     const double local_t0 = profile ? dist_now_sec() : 0.0;
     int rc = ds4_session_eval_layer_slice(session,
                                           tokens,
@@ -2760,6 +3114,7 @@ static int dist_coordinator_eval_span(
                                                 reset_session,
                                                 hidden,
                                                 hidden_bytes,
+                                                ipc_slot,
                                                 logits,
                                                 err,
                                                 errlen);
@@ -3204,6 +3559,7 @@ static void dist_prefill_sender_cancel(ds4_dist_prefill_sender *sender) {
 }
 
 static void *dist_prefill_sender_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_prefill_sender *sender = arg;
     for (;;) {
         pthread_mutex_lock(&sender->mu);
@@ -3233,6 +3589,7 @@ static void *dist_prefill_sender_main(void *arg) {
                                                          slot->ack_only,
                                                          slot->hidden,
                                                          slot->hidden_bytes,
+                                                         -1, /* prefill pipeline stays on TCP */
                                                          send_err,
                                                          sizeof(send_err));
         const double send_t1 = dist_now_sec();
@@ -3341,6 +3698,7 @@ static bool dist_prefill_reader_wait_flow_window(
 }
 
 static void *dist_prefill_result_reader_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_prefill_result_reader *reader = arg;
     reader->rc = 0;
     reader->err[0] = '\0';
@@ -4144,6 +4502,7 @@ static void dist_coordinator_monitor_worker_fd(
 }
 
 static void *dist_coordinator_client_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_client_ctx *ctx = arg;
     int fd = ctx->fd;
     ds4_dist_coordinator_state *state = ctx->state;
@@ -4249,7 +4608,11 @@ static void *dist_coordinator_client_main(void *arg) {
         return NULL;
     }
 
-    dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name);
+    /* A worker with a GPU IPC inbox advertises it right after HELLO; wait
+     * briefly so registration order stays deterministic. Same-host peers
+     * map it and move activations over NVLink/P2P instead of TCP. */
+    ds4_dist_ipc_link *ipc_link = dist_ipc_read_advert_link(fd, 1000);
+    dist_coordinator_add_worker(state, fd, peer_host, peer_port, &hello, model_name, ipc_link);
 
     if (state->use_control_for_work) {
         dist_coordinator_monitor_worker_fd(state, fd, peer_host, peer_port);
@@ -4278,6 +4641,7 @@ static void *dist_coordinator_client_main(void *arg) {
 }
 
 static void *dist_coordinator_accept_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_accept_ctx *accept_ctx = arg;
     int listen_fd = accept_ctx->listen_fd;
     ds4_dist_coordinator_state *state = accept_ctx->state;
@@ -4616,6 +4980,16 @@ static bool dist_kv_layer_tensor_bytes(
         uint32_t n_index_comp,
         uint64_t *out) {
     if (!layout || !out) return false;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return ds4_engine_glm_layer_payload_bytes(engine,
+                                                  layer,
+                                                  layout->raw_live,
+                                                  layout->head_dim,
+                                                  layout->indexer_head_dim,
+                                                  n_comp,
+                                                  n_index_comp,
+                                                  out);
+    }
     uint64_t bytes = 0;
     uint64_t tmp = 0;
     if (!dist_u64_mul(layout->raw_live, layout->head_dim, &tmp) ||
@@ -4668,12 +5042,15 @@ static bool dist_kv_layout_matches(
            a->raw_live == b->raw_live;
 }
 
-static bool dist_kv_raw_live_valid(const ds4_dist_kv_layout *layout) {
+static bool dist_kv_raw_live_valid(ds4_engine *engine, const ds4_dist_kv_layout *layout) {
     if (!layout || layout->raw_window == 0 || layout->raw_cap == 0) return false;
-    const uint32_t expected =
+    const uint32_t max_live =
         layout->token_count < layout->raw_window ? layout->token_count : layout->raw_window;
-    return layout->raw_live == expected &&
-           layout->raw_live <= layout->raw_cap;
+    if (ds4_engine_is_glm_dsa(engine)) {
+        return layout->raw_live <= max_live &&
+               layout->raw_live <= layout->raw_cap;
+    }
+    return layout->raw_live == max_live && layout->raw_live <= layout->raw_cap;
 }
 
 static int dist_kv_parse_layer_payload(
@@ -4725,7 +5102,7 @@ static int dist_kv_parse_layer_payload(
         return 1;
     }
     if (got.n_layers != (uint32_t)ds4_engine_layer_count(engine) ||
-        !dist_kv_raw_live_valid(&got)) {
+        !dist_kv_raw_live_valid(engine, &got)) {
         if (errlen) snprintf(err, errlen, "distributed KV shard layout is invalid");
         return 1;
     }
@@ -5251,7 +5628,7 @@ int ds4_dist_session_load_payload(
         layout.ctx > (uint32_t)ds4_session_ctx(owner) ||
         layout.token_count >= (uint32_t)ds4_session_ctx(owner) ||
         layout.vocab != (uint32_t)ds4_engine_vocab_size(d->state.engine) ||
-        !dist_kv_raw_live_valid(&layout)) {
+        !dist_kv_raw_live_valid(d->state.engine, &layout)) {
         if (errlen) snprintf(err, errlen, "DS4 KV payload does not match current distributed runtime");
         return 1;
     }
@@ -5648,10 +6025,6 @@ int ds4_dist_session_eval(
     }
     if (dist_session_ensure_route(d, err, errlen) != 0) return 1;
 
-    ds4_tokens transcript = {0};
-    ds4_tokens_copy(&transcript, checkpoint);
-    ds4_tokens_push(&transcript, token);
-
     int rc = dist_coordinator_eval_span(&d->state,
                                         owner,
                                         &d->plan,
@@ -5665,6 +6038,9 @@ int ds4_dist_session_eval(
                                         err,
                                         errlen);
     if (rc != 0) {
+        ds4_tokens transcript = {0};
+        ds4_tokens_copy(&transcript, checkpoint);
+        ds4_tokens_push(&transcript, token);
         if (dist_coordinator_rebuild_from_transcript(&d->state,
                                                      owner,
                                                      &d->plan,
@@ -5682,9 +6058,9 @@ int ds4_dist_session_eval(
             return 1;
         }
         d->plan_ready = true;
+        ds4_tokens_free(&transcript);
         rc = 0;
     }
-    ds4_tokens_free(&transcript);
     return rc;
 }
 
@@ -5755,6 +6131,26 @@ static int dist_run_coordinator(ds4_engine *engine, const ds4_dist_options *opt,
  * Worker Control Loop And Result Frames
  * ========================================================================= */
 
+/* Handles an incoming DS4_DIST_MSG_IPC_INBOX frame on a worker connection.
+ * A query (slot_count 0) is answered with our inbox advert; an unsolicited
+ * advert is parsed and ignored. Returns 1 to continue the read loop, 0 on
+ * clean EOF, -1 on error. */
+static int dist_worker_handle_ipc_inbox_frame(
+        ds4_dist_worker_upstream *upstream,
+        int fd,
+        uint32_t bytes) {
+    ds4_dist_ipc_advert adv;
+    int rc = dist_ipc_read_advert_payload(fd, bytes, &adv);
+    if (rc <= 0) return rc;
+    if (adv.slot_count != 0) return 1; /* unsolicited advert: ignore */
+    const ds4_dist_ipc_advert *local =
+        dist_ipc_enabled() ? dist_ipc_local_inbox() : NULL;
+    pthread_mutex_lock(&upstream->write_mu);
+    rc = dist_ipc_write_advert(fd, local);
+    pthread_mutex_unlock(&upstream->write_mu);
+    return rc == 0 ? 1 : -1;
+}
+
 static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
     ds4_dist_worker_upstream upstream;
     dist_worker_upstream_init(&upstream, state, fd);
@@ -5802,6 +6198,14 @@ static int dist_worker_read_loop(ds4_dist_worker_state *state, int fd) {
         }
         if (type == DS4_DIST_MSG_SNAPSHOT_LOAD_BEGIN) {
             rc = dist_worker_handle_snapshot_load(state, &upstream, bytes);
+            if (rc <= 0) {
+                loop_rc = rc == 0 ? 0 : 1;
+                break;
+            }
+            continue;
+        }
+        if (type == DS4_DIST_MSG_IPC_INBOX) {
+            rc = dist_worker_handle_ipc_inbox_frame(&upstream, fd, bytes);
             if (rc <= 0) {
                 loop_rc = rc == 0 ? 0 : 1;
                 break;
@@ -6423,6 +6827,7 @@ static void dist_worker_forwarder_close_queue(ds4_dist_worker_forwarder *forward
 }
 
 static void *dist_worker_forwarder_relay_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_worker_forwarder *forwarder = arg;
     ds4_dist_worker_upstream *upstream = forwarder->upstream;
     int fd = forwarder->fd;
@@ -6651,6 +7056,9 @@ static ds4_dist_worker_forwarder *dist_worker_get_forwarder(
     forwarder->port = port;
     forwarder->fd = fd;
     forwarder->pending_depth = dist_worker_forward_window();
+    /* Ask the next hop for its GPU IPC inbox before the relay thread owns
+     * the read side of this connection. NULL means TCP activations. */
+    forwarder->ipc = dist_ipc_query_peer_link(fd);
     pthread_mutex_init(&forwarder->send_mu, NULL);
     pthread_mutex_init(&forwarder->queue_mu, NULL);
     pthread_cond_init(&forwarder->queue_not_full, NULL);
@@ -6692,6 +7100,7 @@ static void dist_worker_upstream_destroy(ds4_dist_worker_upstream *upstream) {
         if (forwarders->thread_started) pthread_join(forwarders->tid, NULL);
         if (forwarders->fd >= 0) close(forwarders->fd);
         dist_worker_forwarder_clear_requests(forwarders);
+        dist_ipc_link_free(forwarders->ipc);
         pthread_cond_destroy(&forwarders->queue_not_full);
         pthread_mutex_destroy(&forwarders->queue_mu);
         pthread_mutex_destroy(&forwarders->send_mu);
@@ -6710,6 +7119,7 @@ static int dist_forward_work_to_next(
         const int *tokens,
         const float *hidden_hc,
         uint32_t hidden_hc_bytes,
+        int ipc_slot,
         const ds4_dist_telemetry_fixed *telemetry,
         const void *route_blob) {
     char err[256];
@@ -6725,13 +7135,24 @@ static int dist_forward_work_to_next(
     forwarded.layer_end = next->layer_end;
     forwarded.route_index = work->route_index + 1u;
     forwarded.flags |= DS4_DIST_WORK_F_INPUT_HC;
-    forwarded.input_hc_bits = dist_activation_bits_or_default(work->input_hc_bits);
-    if (!dist_activation_wire_bytes_from_f32_bytes(forwarded.input_hc_bits,
-                                                   hidden_hc_bytes,
-                                                   &forwarded.input_hc_bytes)) {
-        return dist_worker_upstream_send_work_error(upstream,
-                                                    request_id,
-                                                    "invalid forwarded hidden-state size");
+    forwarded.flags &= ~DS4_DIST_WORK_F_INPUT_HC_IPC;
+    uint32_t ipc_desc[2];
+    if (ipc_slot >= 0 && hidden_hc_bytes != 0) {
+        /* Hidden state already sits in the next hop's GPU inbox slot. */
+        dist_ipc_desc_build((uint32_t)ipc_slot, hidden_hc_bytes, ipc_desc);
+        forwarded.flags |= DS4_DIST_WORK_F_INPUT_HC_IPC;
+        forwarded.input_hc_bytes = DS4_DIST_IPC_DESC_BYTES;
+        forwarded.input_hc_bits = 32u;
+        hidden_hc = (const float *)ipc_desc;
+    } else {
+        forwarded.input_hc_bits = dist_activation_bits_or_default(work->input_hc_bits);
+        if (!dist_activation_wire_bytes_from_f32_bytes(forwarded.input_hc_bits,
+                                                       hidden_hc_bytes,
+                                                       &forwarded.input_hc_bytes)) {
+            return dist_worker_upstream_send_work_error(upstream,
+                                                        request_id,
+                                                        "invalid forwarded hidden-state size");
+        }
     }
     if ((next->flags & DS4_DIST_ROUTE_F_OUTPUT_LOGITS) != 0) {
         forwarded.flags |= DS4_DIST_WORK_F_OUTPUT_LOGITS;
@@ -7223,6 +7644,10 @@ static int dist_worker_process_work_payload(
     const bool output_logits = (work.flags & DS4_DIST_WORK_F_OUTPUT_LOGITS) != 0;
     const bool input_hc_present = (work.flags & DS4_DIST_WORK_F_INPUT_HC) != 0;
     const bool ack_only = (work.flags & DS4_DIST_WORK_F_ACK_ONLY) != 0;
+    const bool input_hc_ipc = (work.flags & DS4_DIST_WORK_F_INPUT_HC_IPC) != 0;
+    if (input_hc_ipc && !input_hc_present) {
+        return dist_worker_upstream_send_work_error(upstream, request_id, "IPC WORK flag requires input hidden-state flag");
+    }
     if (input_hc_present && work.layer_start == 0) {
         return dist_worker_upstream_send_work_error(upstream, request_id, "layer 0 WORK must not provide input hidden-state");
     }
@@ -7273,7 +7698,31 @@ static int dist_worker_process_work_payload(
 
     float *input_hc = NULL;
     const void *input_hc_wire = NULL;
-    if (input_hc_present) {
+    uint32_t ipc_slot_idx = 0;
+    if (input_hc_present && input_hc_ipc) {
+        /* The activation payload is an 8-byte {slot, bytes} descriptor for
+         * our GPU IPC inbox; the hidden state was written there directly
+         * by the sender's GPU. */
+        if (work.input_hc_bytes != DS4_DIST_IPC_DESC_BYTES ||
+            reader.remaining < DS4_DIST_IPC_DESC_BYTES) {
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "invalid IPC activation descriptor");
+        }
+        uint32_t desc[2];
+        memcpy(desc, reader.p, sizeof(desc));
+        reader.p += DS4_DIST_IPC_DESC_BYTES;
+        reader.remaining -= DS4_DIST_IPC_DESC_BYTES;
+        ipc_slot_idx = ntohl(desc[0]);
+        const uint32_t ipc_hc_bytes = ntohl(desc[1]);
+        const ds4_dist_ipc_advert *inbox = dist_ipc_local_inbox();
+        if (!dist_ipc_local_inbox_ready() ||
+            ipc_slot_idx >= inbox->slot_count ||
+            ipc_hc_bytes != expected_hc_bytes ||
+            (uint64_t)ipc_hc_bytes > inbox->slot_bytes) {
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "IPC activation descriptor does not match inbox");
+        }
+    } else if (input_hc_present) {
         uint32_t expected_hc_wire_bytes = 0;
         if (!dist_activation_bits_valid(input_hc_bits) ||
             !dist_activation_wire_bytes(input_hc_bits,
@@ -7406,7 +7855,7 @@ static int dist_worker_process_work_payload(
     const double decode_t0 = profile ? dist_now_sec() : 0.0;
     bool input_hc_uses_wire = false;
     uint32_t input_hc_decoded_bytes = 0;
-    if (input_hc_present &&
+    if (input_hc_present && !input_hc_ipc &&
         dist_decode_activation_payload(input_hc_wire,
                                        input_hc_bits,
                                        work.input_hc_bytes,
@@ -7420,7 +7869,8 @@ static int dist_worker_process_work_payload(
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, err);
     }
-    if (input_hc_present && input_hc_decoded_bytes != expected_hc_bytes) {
+    if (input_hc_present && !input_hc_ipc &&
+        input_hc_decoded_bytes != expected_hc_bytes) {
         if (!input_hc_uses_wire) free(input_hc);
         free(result);
         free(route_blob);
@@ -7428,6 +7878,27 @@ static int dist_worker_process_work_payload(
         return dist_worker_upstream_send_work_error(upstream, request_id, "decoded input hidden-state size does not match token span");
     }
     const double decode_t1 = profile ? dist_now_sec() : 0.0;
+
+    /* GPU IPC: resolve the local inbox slot for the input, and try to
+     * acquire a slot in the NEXT hop's inbox so the produced hidden state
+     * moves device-to-device as well. Forward-slot failures silently fall
+     * back to the TCP payload. */
+    const void *ipc_in = NULL;
+    void *ipc_in_evt = NULL;
+    if (input_hc_ipc) {
+        ipc_in = dist_ipc_local_slot_ptr(ipc_slot_idx);
+        ipc_in_evt = dist_ipc_local_slot_event(ipc_slot_idx);
+    }
+    ds4_dist_worker_forwarder *fwd_ipc = NULL;
+    int fwd_ipc_slot = -1;
+    if (has_next && produce_hidden && dist_ipc_enabled()) {
+        char ferr[256];
+        fwd_ipc = dist_worker_get_forwarder(upstream, next_route.host, next_route.port,
+                                            ferr, sizeof(ferr));
+        if (fwd_ipc && fwd_ipc->ipc) {
+            fwd_ipc_slot = dist_ipc_link_acquire_slot(fwd_ipc->ipc, result_bytes);
+        }
+    }
 
     const double lock_t0 = profile ? dist_now_sec() : 0.0;
     pthread_mutex_lock(&state->mu);
@@ -7473,6 +7944,23 @@ static int dist_worker_process_work_payload(
         free(route_blob);
         free(tokens);
         return dist_worker_upstream_send_work_error(upstream, request_id, "worker KV prefix hash mismatch");
+    }
+    if ((ipc_in || fwd_ipc_slot >= 0) &&
+        !ds4_session_layer_slice_device_io(
+                session->session,
+                ipc_in,
+                ipc_in_evt,
+                fwd_ipc_slot >= 0 ? dist_ipc_link_slot_ptr(fwd_ipc->ipc, fwd_ipc_slot)
+                                  : NULL)) {
+        if (ipc_in) {
+            /* We advertised the inbox; the input exists only on the GPU. */
+            pthread_mutex_unlock(&state->mu);
+            free(result);
+            free(route_blob);
+            free(tokens);
+            return dist_worker_upstream_send_work_error(upstream, request_id, "backend refused GPU IPC input redirect");
+        }
+        fwd_ipc_slot = -1;
     }
     const double eval_t0 = dist_now_sec();
     int eval_rc = ds4_session_eval_layer_slice(session->session,
@@ -7547,6 +8035,7 @@ static int dist_worker_process_work_payload(
                                             tokens,
                                             result,
                                             result_bytes,
+                                            fwd_ipc_slot,
                                             &telemetry,
                                             route_blob);
     } else {
@@ -7710,6 +8199,7 @@ static ds4_dist_worker_job *dist_worker_job_queue_pop(ds4_dist_worker_job_queue 
 }
 
 static void *dist_worker_prefetch_eval_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_worker_job_queue *q = arg;
     for (;;) {
         ds4_dist_worker_job *job = dist_worker_job_queue_pop(q);
@@ -7820,6 +8310,14 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
             }
             continue;
         }
+        if (type == DS4_DIST_MSG_IPC_INBOX) {
+            rc = dist_worker_handle_ipc_inbox_frame(&upstream, fd, bytes);
+            if (rc <= 0) {
+                loop_rc = rc == 0 ? 0 : 1;
+                break;
+            }
+            continue;
+        }
         rc = dist_discard_bytes(fd, bytes);
         if (rc <= 0) {
             loop_rc = rc == 0 ? 0 : 1;
@@ -7843,6 +8341,7 @@ static int dist_worker_read_loop_prefetch(ds4_dist_worker_state *state, int fd) 
 }
 
 static void *dist_worker_data_client_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_data_client_ctx *ctx = arg;
     ds4_dist_worker_state *state = ctx->state;
     int fd = ctx->fd;
@@ -7867,6 +8366,7 @@ static void *dist_worker_data_client_main(void *arg) {
 }
 
 static void *dist_worker_data_listener_main(void *arg) {
+    dist_gpu_bind_thread();
     ds4_dist_worker_state *state = arg;
     int listen_fd = state->listen_fd;
     for (;;) {
@@ -7976,6 +8476,16 @@ static int dist_run_worker(ds4_engine *engine, const ds4_dist_options *opt, int 
 
         if (dist_send_hello(engine, opt, ctx_size, listen_port, fd) != 0) {
             fprintf(stderr, "ds4: distributed worker: failed to send HELLO: %s\n", strerror(errno));
+            close(fd);
+            dist_sleep_reconnect();
+            continue;
+        }
+        /* Advertise the GPU IPC inbox right after HELLO so a same-host
+         * coordinator can push activations over NVLink/P2P. A 0-slot
+         * advert tells it to keep using TCP. */
+        if (dist_ipc_enabled() &&
+            dist_ipc_write_advert(fd, dist_ipc_local_inbox()) != 0) {
+            fprintf(stderr, "ds4: distributed worker: failed to send IPC advert\n");
             close(fd);
             dist_sleep_reconnect();
             continue;

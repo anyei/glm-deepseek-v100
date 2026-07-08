@@ -1,0 +1,107 @@
+# ============================================================================
+# ds4 distributed inference on 2x Tesla V100 (NVLink) — one process per GPU.
+#
+#   coordinator  GPU 0  layers 0..21   ds4-server (OpenAI-style API on :8080)
+#   worker       GPU 1  layers 22..output
+#
+# Hidden-state activations hop GPU-to-GPU over NVLink via CUDA IPC (see
+# VOLTA.md). That imposes three container requirements, all encoded below:
+#   - BOTH GPUs visible in BOTH containers (CUDA IPC cannot map memory from
+#     a hidden device) — the per-process GPU is chosen with DS4_CUDA_DEVICE;
+#   - shared ipc/pid namespaces (`ipc: host`, `pid: host`) so the CUDA
+#     driver can wire the cross-process mappings;
+#   - host networking, so the TCP control plane uses loopback.
+#
+# Verify the fast path in the logs after the model loads:
+#   docker compose logs | grep "GPU IPC"
+#   -> "GPU IPC inbox ready"              (worker)
+#   -> "GPU IPC activation path enabled"  (coordinator)
+# Set DS4_DIST_NO_IPC=1 on both services to force TCP activations (A/B test).
+#
+# Tunables come from .env or the shell:
+#   DS4_MODELS_DIR   host dir with the GGUF        (default ../ds4-models)
+#   DS4_MODEL        GGUF filename in that dir
+#   DS4_CTX          context tokens                (default 16384)
+#   DS4_COORD_CACHE  GPU0 expert-cache budget      (default 8GB)
+#   DS4_WORKER_CACHE GPU1 expert-cache budget      (default 8GB)
+# Size the caches to VRAM that is actually free — check `nvidia-smi` first;
+# other workloads (e.g. a llama.cpp server) may already hold several GiB.
+# ============================================================================
+
+x-ds4-common: &ds4-common
+  build: .
+  image: ds4:sm70-ipc
+  ipc: host
+  pid: host
+  network_mode: host
+  restart: unless-stopped
+  volumes:
+    - ${DS4_MODELS_DIR:-../ds4-models}:/models:ro
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+services:
+  coordinator:
+    <<: *ds4-common
+    container_name: ds4-coordinator
+    environment:
+      DS4_CUDA_DEVICE: "0"
+      DS4_LOCK_FILE: /tmp/ds4-coordinator.lock
+    # Image entrypoint is /app/ds4-server: coordinator owns tokenization,
+    # sampling, its layer slice, and the HTTP API.
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      - --ssd-streaming
+      - --ssd-streaming-cache-experts
+      - ${DS4_COORD_CACHE:-8GB}
+      - --ctx
+      - ${DS4_CTX:-16384}
+      - --role
+      - coordinator
+      - --layers
+      - 0:21
+      - --listen
+      - 127.0.0.1
+      - "18801"
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+
+  worker:
+    <<: *ds4-common
+    container_name: ds4-worker
+    depends_on:
+      - coordinator
+    environment:
+      DS4_CUDA_DEVICE: "1"
+      DS4_LOCK_FILE: /tmp/ds4-worker.lock
+    # Plain ds4 binary in worker mode; it holds the output head and returns
+    # logits. It reconnects forever, so start order is not critical.
+    entrypoint: ["/app/ds4"]
+    healthcheck:
+      disable: true
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      - --ssd-streaming
+      - --ssd-streaming-cache-experts
+      - ${DS4_WORKER_CACHE:-8GB}
+      - --ctx
+      - ${DS4_CTX:-16384}
+      - --role
+      - worker
+      - --layers
+      - 22:output
+      - --coordinator
+      - 127.0.0.1
+      - "18801"
+      - --listen
+      - 127.0.0.1
+      - "18802"

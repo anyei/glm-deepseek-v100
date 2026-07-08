@@ -4579,6 +4579,39 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     return cuda_ok(cudaMemcpy(data, (const char *)tensor->ptr + offset, (size_t)bytes, cudaMemcpyDeviceToHost), "tensor read");
 }
 
+/* Distributed same-host GPU IPC is CUDA-only for now; ROCm reports
+ * unsupported so the distributed layer keeps the TCP activation path. */
+extern "C" int ds4_gpu_dist_ipc_supported(void) { return 0; }
+extern "C" void ds4_gpu_bind_thread_device(void) {}
+extern "C" uint32_t ds4_gpu_glm_kernel_caps(void) { return 0; }
+extern "C" void *ds4_gpu_dist_ipc_inbox_create(uint64_t bytes, uint32_t slot_count,
+                                               void *mem_handle_out,
+                                               void *event_handles_out,
+                                               void **events_out) {
+    (void)bytes; (void)slot_count; (void)mem_handle_out;
+    (void)event_handles_out; (void)events_out;
+    return NULL;
+}
+extern "C" void ds4_gpu_dist_ipc_inbox_destroy(void *dev_ptr, void **events, uint32_t slot_count) {
+    (void)dev_ptr; (void)events; (void)slot_count;
+}
+extern "C" void *ds4_gpu_dist_ipc_open_mem(const void *mem_handle) { (void)mem_handle; return NULL; }
+extern "C" void ds4_gpu_dist_ipc_close_mem(void *mapped) { (void)mapped; }
+extern "C" void *ds4_gpu_dist_ipc_open_event(const void *event_handle) { (void)event_handle; return NULL; }
+extern "C" void ds4_gpu_dist_ipc_close_event(void *event) { (void)event; }
+extern "C" int ds4_gpu_dist_ipc_event_wait(void *event) { (void)event; return 0; }
+extern "C" int ds4_gpu_tensor_write_from_devptr(ds4_gpu_tensor *tensor, uint64_t offset,
+                                                const void *src_dev, uint64_t bytes,
+                                                void *notify_event) {
+    (void)tensor; (void)offset; (void)src_dev; (void)bytes; (void)notify_event;
+    return 0;
+}
+extern "C" int ds4_gpu_tensor_read_to_devptr(const ds4_gpu_tensor *tensor, uint64_t offset,
+                                             void *dst_dev, uint64_t bytes) {
+    (void)tensor; (void)offset; (void)dst_dev; (void)bytes;
+    return 0;
+}
+
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                      const ds4_gpu_tensor *src, uint64_t src_offset,
                                      uint64_t bytes) {
@@ -4596,6 +4629,21 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
 extern "C" int ds4_gpu_begin_commands(void) { return 1; }
 extern "C" int ds4_gpu_flush_commands(void) { return cuda_ok(cudaDeviceSynchronize(), "flush"); }
+extern "C" int ds4_gpu_commands_active(void) { return 0; }
+extern "C" int ds4_gpu_signal_selected_readback_ready(uint64_t *event_value) {
+    if (event_value) *event_value = 1;
+    return 1;
+}
+extern "C" int ds4_gpu_commit_and_wait_selected_readback(uint64_t event_value, const char *label) {
+    (void)event_value;
+    (void)label;
+    return cuda_ok(cudaDeviceSynchronize(), "selected readback");
+}
+extern "C" int ds4_gpu_wait_selected_readback_ready(uint64_t event_value, const char *label) {
+    (void)event_value;
+    (void)label;
+    return cuda_ok(cudaDeviceSynchronize(), "selected readback wait");
+}
 extern "C" int ds4_gpu_end_commands(void) {
     return cuda_ok(cudaDeviceSynchronize(), "end commands");
 }
