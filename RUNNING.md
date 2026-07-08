@@ -8,8 +8,8 @@ Build or rebuild it with:
 docker build -t ds4:sm70-ipc .
 ```
 
-Model files live outside the image; mount the directory read-only. The GGUF
-used below is `~/server/git-projects/ds4-models/`.
+Model files live outside the image; mount the directory read-only. The GGUFs
+used below live in a `./models/` directory next to the repo.
 
 ## Recommended: both GPUs via docker compose
 
@@ -17,7 +17,7 @@ The compose stack runs the model split across both V100s, with activations
 crossing GPU-to-GPU over NVLink (see VOLTA.md for the internals):
 
 ```sh
-cd ~/server/git-projects/ds4
+cd glm-deepseek-v100/
 docker compose up -d
 docker compose logs -f     # wait for the model load, then check:
                            #   "GPU IPC inbox ready"               (worker)
@@ -56,7 +56,7 @@ Stop with `docker compose down`.
 
 ```sh
 docker run --rm --gpus '"device=0"' -p 8080:8080 \
-  -v ~/server/git-projects/ds4-models:/models:ro \
+  -v ./models:/models:ro \
   ds4:sm70-ipc \
   -m /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --ssd-streaming --ssd-streaming-cache-experts 8GB \
@@ -67,7 +67,7 @@ One-shot prompt with the CLI instead of the server:
 
 ```sh
 docker run --rm --gpus '"device=0"' \
-  -v ~/server/git-projects/ds4-models:/models:ro \
+  -v ./models:/models:ro \
   --entrypoint /app/ds4 ds4:sm70-ipc \
   -m /models/<model>.gguf --ssd-streaming --ctx 8192 \
   --nothink -n 256 -p "your prompt"
@@ -76,7 +76,7 @@ docker run --rm --gpus '"device=0"' \
 Inspect a GGUF without loading it onto the GPU:
 
 ```sh
-docker run --rm -v ~/server/git-projects/ds4-models:/models:ro \
+docker run --rm -v ./models:/models:ro \
   --entrypoint /app/ds4 ds4:sm70-ipc --inspect -m /models/<model>.gguf
 ```
 

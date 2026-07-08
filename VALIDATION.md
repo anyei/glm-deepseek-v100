@@ -5,17 +5,16 @@ exact commands and the reference numbers they were measured against.
 
 Reference hardware: Tesla V100-SXM2-32GB, models on local NVMe (device
 ceiling for the streaming access pattern: ~2.45 GB/s at QD4+, ~1.98 GB/s
-at QD1 for 4 MiB direct reads). Canonical tree:
-`~/server/git-projects/ds4`, branch `glm5.2`. The image built from it is
-`ds4:sm70-glm-fix` below; substitute your tag.
+at QD1 for 4 MiB direct reads). Canonical tree: `glm-deepseek-v100/`. The
+image built from it is `ds4:sm70-glm-fix` below; substitute your tag.
 
 Models used throughout:
 
 | Purpose | File |
 | --- | --- |
-| GLM benchmarks | `/mnt/full-models/ds4/gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` |
+| GLM benchmarks | `glm-deepseek-v100/gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` |
 | GLM numerical oracle | `GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf` (on the oracle box) |
-| DeepSeek regression | `~/server/git-projects/ds4-models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf` |
+| DeepSeek regression | `./models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf` |
 
 ## 0. Environment notes (read first)
 
@@ -44,7 +43,7 @@ Models used throughout:
 CPU build links clean (catches missing symbols the CUDA build hides):
 
 ```sh
-cd ~/server/git-projects/ds4
+cd glm-deepseek-v100/
 make cpu -j12 2>&1 | grep -cE 'error|undefined'   # expect: 0
 ```
 
@@ -65,12 +64,12 @@ Single raw-token prompt, first-token logits, CPU reference vs the CUDA
 graph. This is the correctness gate for kernel changes.
 
 CPU oracle (any box that holds the model on local disk; a CPU-only build
-lives in `~/ds4-oracle` on the oracle host):
+of this tree lives on the oracle host):
 
 ```sh
-ssh <oracle-host> 'cd ~/ds4-oracle && DS4_LOCK_FILE=/tmp/ds4-oracle.lock \
+ssh <oracle-host> 'cd glm-deepseek-v100/ && DS4_LOCK_FILE=/tmp/ds4-oracle.lock \
   ./ds4 --cpu --first-token-test --raw \
-  -m ~/glm-models/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
+  -m ./models/GLM-5.2-UD-IQ2_XXS_RoutedIQ2XXS_blk78Q2K.gguf \
   -p "hello" 2>&1 | tail -14'
 ```
 
@@ -101,7 +100,7 @@ docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
   -e DS4_GLM_CUDA_EXPERIMENTAL=1 \
   -e DS4_CUDA_STREAMING_EXPERT_CACHE_VERBOSE=1 \
-  -v /mnt/full-models/ds4/gguf:/models:ro \
+  -v ./gguf:/models:ro \
   --entrypoint /app/ds4 ds4:sm70-glm-fix \
   -m /models/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf --cuda \
   --ssd-streaming --ssd-streaming-cache-experts 26GB \
@@ -167,7 +166,7 @@ expert caches with DeepSeek — always smoke it:
 ```sh
 docker run --rm --runtime=nvidia -e NVIDIA_VISIBLE_DEVICES=0 \
   -e NVIDIA_DRIVER_CAPABILITIES=compute,utility \
-  -v ~/server/git-projects/ds4-models:/models:ro \
+  -v ./models:/models:ro \
   --entrypoint /app/ds4 ds4:sm70-glm-fix \
   -m /models/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf \
   --cuda --ssd-streaming --ssd-streaming-cache-experts 8GB \
