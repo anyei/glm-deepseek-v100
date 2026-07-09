@@ -281,6 +281,21 @@ gate the peer-cache fix and the main fast-forward):
    into a non-issue and is the merge gate for forwarding shared
    improvements to another branch (e.g. glm5.2 -> main).
 
+   **Fast variant (host-side / non-numeric changes only).** When the
+   change cannot alter kernel math (host-side dedup, cached getenvs,
+   allocation plumbing) a full 100-case score is overkill — the two
+   binaries share identical kernels, so identical logits are exactly
+   provable. Build old + new in worktrees, run each once with
+   `--dump-logprobs out.json --logprobs-top-k 20 -p "<fixed prompt>"
+   -n 48` (single GPU, any modest `--ssd-streaming-cache-experts` budget
+   — cache size changes hit/miss rates, not logits) and `cmp -s` the
+   dumps. The dump is fully deterministic (no timestamps/seed), so
+   byte-identical output = numerics unchanged. ~15 min on one V100 vs
+   ~2.3 h for the full A/B; first used 2026-07-08 to gate commit
+   `885edc2`. Caveat: a single-GPU run does not exercise distributed-only
+   code — cover that separately or by review. Not a substitute for the
+   soak/fixture when a change *does* touch numerics.
+
 DeepSeek Flash IQ2XXS baseline (recorded 2026-07-08, glm5.2 tree,
 26 GiB expert budget, no L2):
 

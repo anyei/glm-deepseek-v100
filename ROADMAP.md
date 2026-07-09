@@ -74,11 +74,17 @@ numerics-adjacent, so each goes through the VALIDATION.md §9 gate
 ## 3. Code quality (deferred from the /simplify pass)
 
 A 4-agent `/simplify` review of the fork's V100/GLM code (2026-07-08) applied
-the safe, behavior-preserving dedups (commit `07472b6`: MoE forwarder alias,
-`ensure_i32`→`ensure_bytes`, shared staging-teardown/lap helpers, cached
-getenvs). These were **deferred** because each touches numeric or
-correctness-critical code and must go through the §4 gate — they can't just be
-committed blind on numerically-validated shipping code.
+the safe, behavior-preserving dedups — **done and merged to `main`** (commit
+`885edc2`: MoE forwarder alias, `ensure_i32`→`ensure_bytes`, shared
+staging-teardown/lap helpers, cached getenvs). That commit cleared both gates:
+a high-effort `/code-review` (no real bugs; one strict-aliasing nit fixed) and
+the §4 binary A/B in its fast deterministic-equivalence form (old vs new
+`--dump-logprobs` over a 37-token prefill + 48 decode steps came back
+byte-identical, same SHA256 — see VALIDATION.md §9).
+
+The items below are the findings that were **deferred**, because each touches
+numeric or correctness-critical code and must go through the §4 gate — they
+can't just be committed blind on numerically-validated shipping code.
 
 - [ ] **Unify the triplicated selected-expert compaction + staging** (top
   structural finding, flagged by 3 of 4 agents). The compact-id remap and the
