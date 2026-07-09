@@ -1,6 +1,13 @@
 .git
 *.o
+# Model weights: `*.gguf` only matches the context root (Docker globs don't
+# cross `/`), so exclude the model dirs by name AND recursively. Without this
+# the 245 GB gguf/ tree is copied into the build context.
 *.gguf
+**/*.gguf
+gguf/
+models/
+venv/
 *.md
 LICENSE
 ds4

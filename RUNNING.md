@@ -52,6 +52,33 @@ cache budget.
 
 Stop with `docker compose down`.
 
+## GLM 5.2 (single process, GPU0 + GPU1 peer expert cache)
+
+GLM's validated best-decode config is **not** a distributed layer split — it is
+one `ds4-server` on GPU0 that borrows GPU1's VRAM as an expert-cache tier over
+NVLink (`DS4_CUDA_PEER_EXPERT_CACHE_GB`, +12% decode vs a single-GPU cache). It
+is an opt-in compose profile, so the default `docker compose up` still brings up
+the DeepSeek pair. Run only the GLM service with:
+
+```sh
+docker compose up glm      # runs the glm service (+ deps), not coordinator/worker
+docker compose logs -f glm
+curl http://127.0.0.1:8080/v1/models
+```
+
+Do not run it alongside the DeepSeek pair — they share port 8080 and want the
+same GPUs; `docker compose down` first. The peer tier needs GPU1's ~26 GB
+actually free, so stop or shrink any llama.cpp server holding it (see VOLTA.md).
+GLM-on-CUDA is on by default; set `DS4_GLM_CUDA_DISABLE=1` to force the old
+Metal-only refusal.
+
+| Variable                | Default                          | Meaning                        |
+|-------------------------|----------------------------------|--------------------------------|
+| `DS4_GLM_MODEL`         | `GLM-5.2-UD-Q2_K_RoutedQ2K.gguf` | GLM GGUF filename in models dir|
+| `DS4_GLM_CACHE`         | `26GB`                           | GPU0 expert-cache VRAM budget   |
+| `DS4_GLM_PEER_CACHE`    | `26`                             | GPU1 peer cache, GB integer     |
+| `DS4_CTX`               | `16384`                          | Context tokens (shared)         |
+
 ## Single GPU (simpler, no distributed mode)
 
 ```sh

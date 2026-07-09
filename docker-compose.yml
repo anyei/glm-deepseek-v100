@@ -26,6 +26,24 @@
 #   DS4_WORKER_CACHE GPU1 expert-cache budget      (default 8GB)
 # Size the caches to VRAM that is actually free — check `nvidia-smi` first;
 # other workloads (e.g. a llama.cpp server) may already hold several GiB.
+#
+# ----------------------------------------------------------------------------
+# GLM 5.2 (single process, GPU0 compute + GPU1 peer expert cache over NVLink)
+#
+# GLM's validated best-decode config is NOT a distributed layer split — it is
+# one ds4-server on GPU0 that borrows GPU1's VRAM as an expert-cache tier over
+# NVLink (DS4_CUDA_PEER_EXPERT_CACHE_GB). It is a separate, opt-in profile so
+# the default `docker compose up` still brings up the DeepSeek pair above.
+#
+#   docker compose up glm            # runs ONLY the glm service (+ its deps)
+#
+# Do not run it alongside the DeepSeek pair — they share port 8080 and want the
+# same GPUs; `docker compose down` first. The peer tier needs GPU1's ~26 GB
+# actually free (stop/shrink any llama.cpp server that holds it — see VOLTA.md).
+# GLM-on-CUDA is on by default; DS4_GLM_CUDA_DISABLE=1 restores the refusal.
+#   DS4_GLM_MODEL       GLM GGUF filename           (default GLM Q2 routed)
+#   DS4_GLM_CACHE       GPU0 expert budget          (default 26GB)
+#   DS4_GLM_PEER_CACHE  GPU1 peer cache, GB integer (default 26)
 # ============================================================================
 
 x-ds4-common: &ds4-common
@@ -105,3 +123,28 @@ services:
       - --listen
       - 127.0.0.1
       - "18802"
+
+  # GLM 5.2 — single process, GPU0 compute + GPU1 peer expert cache (opt-in).
+  # `docker compose up glm` runs only this service; see the header for details.
+  glm:
+    <<: *ds4-common
+    profiles: ["glm"]
+    container_name: ds4-glm
+    environment:
+      DS4_CUDA_DEVICE: "0"
+      DS4_CUDA_PEER_EXPERT_CACHE_GB: ${DS4_GLM_PEER_CACHE:-26}
+      DS4_LOCK_FILE: /tmp/ds4-glm.lock
+    # Image entrypoint is /app/ds4-server. Both GPUs are visible (ds4-common
+    # reserves count:all) so the peer cache can mirror into GPU1 over NVLink.
+    command:
+      - -m
+      - /models/${DS4_GLM_MODEL:-GLM-5.2-UD-Q2_K_RoutedQ2K.gguf}
+      - --ssd-streaming
+      - --ssd-streaming-cache-experts
+      - ${DS4_GLM_CACHE:-26GB}
+      - --ctx
+      - ${DS4_CTX:-16384}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
