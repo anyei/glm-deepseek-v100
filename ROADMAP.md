@@ -46,6 +46,18 @@ The first three landed 2026-07-08 (commit `505c5ea`).
 - [x] **Delete the merged `glm5.2` branch** — done, local + origin.
 - [ ] **Decide on upstreaming.** The GLM CUDA port is Metal-only upstream;
   decide whether to offer it back to DwarfStar. (Your call — not a code task.)
+  Feasibility assessed 2026-07-09: **clean and self-contained.**
+  `ds4_cuda_glm.inc` has zero Volta-specific code (no `__CUDA_ARCH__`/`sm_70`/
+  FP16-GEMM) and zero dependency on the fork's cache-tier/IPC additions — it
+  rides only the base (upstream) streaming path. And it implements an API
+  upstream already ships for Metal (`ds4_gpu_glm_*`: 32 decls in `ds4_gpu.h`,
+  125 impls in `ds4_metal.m`), so a PR is "add the CUDA impl of existing
+  hooks" — `ds4_cuda_glm.inc` + its `#include` + the caps wiring + drop the
+  CUDA engine-open refusal, plus the validation evidence (§8). The Volta perf
+  work (FP16 GEMM, cache tiers, NVLink IPC) is separable and would be a
+  distinct, more niche PR. Open questions are non-technical: does upstream want
+  GLM-on-CUDA, are the fixtures shareable, the AI-assisted-dev disclosure,
+  maintenance.
 
 ## 2. Performance phase (the real work)
 
