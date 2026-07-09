@@ -517,6 +517,19 @@ static uint64_t cuda_parse_mib_env(const char *name, int *present) {
     return (uint64_t)v * 1048576ull;
 }
 
+/* Parse a gibibyte budget env var ("<name>=<N>"): returns N clamped to
+ * [0,1024], or 0 when unset/blank/malformed. Shared by the opt-in host-L2 and
+ * peer expert-cache tiers, whose GB parsers were byte-identical. */
+static uint64_t cuda_parse_gb_env(const char *name) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long long v = strtoull(env, &end, 10);
+    if (end != env && errno == 0 && v <= 1024) return (uint64_t)v;
+    return 0;
+}
+
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
     int present = 0;
     const uint64_t limit = cuda_parse_mib_env("DS4_CUDA_Q8_F16_CACHE_MB", &present);
@@ -1751,14 +1764,7 @@ static uint32_t cuda_stream_expert_peer_budget_experts(
         int     *peer_device_out) {
     *peer_device_out = -1;
     if (expert_bytes == 0) return 0;
-    uint64_t gb = 0;
-    const char *env = getenv("DS4_CUDA_PEER_EXPERT_CACHE_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        errno = 0;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && errno == 0 && v <= 1024) gb = (uint64_t)v;
-    }
+    uint64_t gb = cuda_parse_gb_env("DS4_CUDA_PEER_EXPERT_CACHE_GB");
     if (gb == 0) return 0;
 
     int ndev = 0;
@@ -2272,14 +2278,7 @@ static uint64_t cuda_host_expert_cache_budget_bytes(void) {
      * clearly larger than the GPU cache barely adds hits (both fill from
      * the same miss stream). Enable with roughly 2x the GPU expert budget
      * or more. */
-    uint64_t gb = 0;
-    const char *env = getenv("DS4_CUDA_HOST_EXPERT_CACHE_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        errno = 0;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && errno == 0 && v <= 1024) gb = (uint64_t)v;
-    }
+    uint64_t gb = cuda_parse_gb_env("DS4_CUDA_HOST_EXPERT_CACHE_GB");
     if (gb == 0) return 0;
     uint64_t budget = gb << 30;
     /* Leave real headroom: pinned pages are not reclaimable. */
