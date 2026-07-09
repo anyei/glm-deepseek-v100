@@ -31,20 +31,21 @@ phase, a 2.8x gain). A decode token is ~2.0 s device-bound expert reads +
 ## 1. Near-term: make the merge real (ops)
 
 Small, high-value, do first. None of this is blocked on the perf work.
+The first three landed 2026-07-08 (commit `505c5ea`).
 
-- [ ] **Rebuild the Docker image from `main`.** Everything deployed
-  (`ds4:sm70-ipc`, the benchmark image) was built from the branch. Verify the
-  new binary with a content check (see VALIDATION.md §1 — `docker build | tail`
-  silently eats the exit code, so grep the shipped binary for a known string).
-- [ ] **Wire a GLM service into docker-compose / RUNNING.md.** Both only
-  describe DeepSeek serving today. Add the validated best-decode config:
-  26 GB expert budget + 26 GB peer cache, host L2 off. Caveat: the peer cache
-  wants GPU1, which the prod llama-server container currently owns — so this
-  needs prod stopped or shrunk (documented in VOLTA.md).
-- [ ] **Delete the merged `glm5.2` branch** (local + origin) — it is 0 commits
-  ahead of `main`.
+- [x] **Rebuild the Docker image from `main`.** Done — `ds4:sm70-ipc`
+  (+ `ds4:main-<sha>`) rebuilt from `main`, content-checked (the cleanup symbol
+  `cuda_stream_selected_stage_free_slots` is in the shipped binary). Also fixed
+  a real `.dockerignore` bug: `*.gguf` only matched the context root, so the
+  245 GB `gguf/` tree was copied into every build context (now ~87 MB).
+- [x] **Wire a GLM service into docker-compose / RUNNING.md.** Done — opt-in
+  `glm` compose profile (single ds4-server on GPU0 + 26 GB GPU1 peer cache over
+  NVLink, the validated best-decode config; `docker compose up glm`). Default
+  `up` still brings up the DeepSeek pair. RUNNING.md documents it + the
+  GPU1-must-be-free caveat.
+- [x] **Delete the merged `glm5.2` branch** — done, local + origin.
 - [ ] **Decide on upstreaming.** The GLM CUDA port is Metal-only upstream;
-  decide whether to offer it back to DwarfStar.
+  decide whether to offer it back to DwarfStar. (Your call — not a code task.)
 
 ## 2. Performance phase (the real work)
 
