@@ -1,11 +1,17 @@
 # ============================================================================
-# ds4 distributed inference on 2x Tesla V100 (NVLink) — one process per GPU.
+# Validated DeepSeek profiles for 2x Tesla V100 (NVLink).
 #
-#   coordinator  GPU 0  layers 0..21   ds4-server (OpenAI-style API on :8080)
-#   worker       GPU 1  layers 22..output
+#   docker compose up -d
+#       Interactive default: GPU0 computes, GPU1 supplies a 26 GiB passive
+#       expert cache. This is the validated decode winner.
 #
-# Hidden-state activations hop GPU-to-GPU over NVLink via CUDA IPC (see
-# VOLTA.md). That imposes three container requirements, all encoded below:
+#   docker compose --profile long-prefill up -d coordinator worker
+#       Long-prefill profile: GPU0 owns layers 0..21 and GPU1 owns
+#       22..output. This is 23-26% faster at 16K-32K prompt ingestion, but its
+#       decode is far slower; do not use it as an interactive server.
+#
+# Hidden-state activations in the long-prefill profile hop GPU-to-GPU over
+# NVLink via CUDA IPC (see VOLTA.md). That imposes three requirements:
 #   - BOTH GPUs visible in BOTH containers (CUDA IPC cannot map memory from
 #     a hidden device) — the per-process GPU is chosen with DS4_CUDA_DEVICE;
 #   - shared ipc/pid namespaces (`ipc: host`, `pid: host`) so the CUDA
@@ -19,11 +25,13 @@
 # Set DS4_DIST_NO_IPC=1 on both services to force TCP activations (A/B test).
 #
 # Tunables come from .env or the shell:
-#   DS4_MODELS_DIR   host dir with the GGUF        (default ../ds4-models)
-#   DS4_MODEL        GGUF filename in that dir
-#   DS4_CTX          context tokens                (default 16384)
-#   DS4_COORD_CACHE  GPU0 expert-cache budget      (default 8GB)
-#   DS4_WORKER_CACHE GPU1 expert-cache budget      (default 8GB)
+#   DS4_MODELS_DIR        host dir with the GGUF        (default ../ds4-models)
+#   DS4_MODEL             GGUF filename inside that dir
+#   DS4_CTX               context tokens                (default 16384)
+#   DS4_INTERACTIVE_CACHE GPU0 expert-cache budget      (default 8GB)
+#   DS4_PEER_CACHE        GPU1 peer cache, GB integer   (default 26)
+#   DS4_COORD_CACHE       long-prefill GPU0 cache       (default 8GB)
+#   DS4_WORKER_CACHE      long-prefill GPU1 cache       (default 8GB)
 # Size the caches to VRAM that is actually free — check `nvidia-smi` first;
 # other workloads (e.g. a llama.cpp server) may already hold several GiB.
 #
@@ -33,12 +41,12 @@
 # GLM's validated best-decode config is NOT a distributed layer split — it is
 # one ds4-server on GPU0 that borrows GPU1's VRAM as an expert-cache tier over
 # NVLink (DS4_CUDA_PEER_EXPERT_CACHE_GB). It is a separate, opt-in profile so
-# the default `docker compose up` still brings up the DeepSeek pair above.
+# the default `docker compose up` still brings up DeepSeek interactive above.
 #
 #   docker compose up glm            # runs ONLY the glm service (+ its deps)
 #
-# Do not run it alongside the DeepSeek pair — they share port 8080 and want the
-# same GPUs; `docker compose down` first. The peer tier needs GPU1's ~26 GB
+# Do not run it alongside a DeepSeek profile — they share port 8080 and want
+# the same GPUs; `docker compose down` first. The peer tier needs GPU1's ~26 GB
 # actually free (stop/shrink any llama.cpp server that holds it — see VOLTA.md).
 # GLM-on-CUDA is on by default; DS4_GLM_CUDA_DISABLE=1 restores the refusal.
 #   DS4_GLM_MODEL       GLM GGUF filename           (default GLM Q2 routed)
@@ -64,8 +72,33 @@ x-ds4-common: &ds4-common
             capabilities: [gpu]
 
 services:
+  # Default DeepSeek profile: best interactive decode on this two-V100 host.
+  interactive:
+    <<: *ds4-common
+    container_name: ds4-interactive
+    environment:
+      DS4_CUDA_DEVICE: "0"
+      DS4_CUDA_PEER_DEVICE: "1"
+      DS4_CUDA_PEER_EXPERT_CACHE_GB: ${DS4_PEER_CACHE:-26}
+      DS4_LOCK_FILE: /tmp/ds4-interactive.lock
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      - --ssd-streaming
+      - --ssd-streaming-cache-experts
+      - ${DS4_INTERACTIVE_CACHE:-8GB}
+      - --ctx
+      - ${DS4_CTX:-16384}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+
+  # Opt-in long-prefill profile. Start both named services explicitly so the
+  # unprofiled interactive service is not started beside them.
   coordinator:
     <<: *ds4-common
+    profiles: ["long-prefill"]
     container_name: ds4-coordinator
     environment:
       DS4_CUDA_DEVICE: "0"
@@ -87,6 +120,12 @@ services:
       - --listen
       - 127.0.0.1
       - "18801"
+      - --prefill-chunk
+      - ${DS4_LONG_PREFILL_CHUNK:-4096}
+      - --dist-prefill-chunk
+      - ${DS4_LONG_PREFILL_CHUNK:-4096}
+      - --dist-prefill-window
+      - ${DS4_LONG_PREFILL_WINDOW:-3}
       - --host
       - 0.0.0.0
       - --port
@@ -94,6 +133,7 @@ services:
 
   worker:
     <<: *ds4-common
+    profiles: ["long-prefill"]
     container_name: ds4-worker
     depends_on:
       - coordinator
@@ -123,6 +163,28 @@ services:
       - --listen
       - 127.0.0.1
       - "18802"
+
+  # Compatibility profile for hosts intentionally using only GPU0.
+  single-gpu:
+    <<: *ds4-common
+    profiles: ["single-gpu"]
+    container_name: ds4-single-gpu
+    environment:
+      NVIDIA_VISIBLE_DEVICES: "0"
+      DS4_CUDA_DEVICE: "0"
+      DS4_LOCK_FILE: /tmp/ds4-single-gpu.lock
+    command:
+      - -m
+      - /models/${DS4_MODEL:-DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf}
+      - --ssd-streaming
+      - --ssd-streaming-cache-experts
+      - ${DS4_SINGLE_CACHE:-8GB}
+      - --ctx
+      - ${DS4_CTX:-16384}
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
 
   # GLM 5.2 — single process, GPU0 compute + GPU1 peer expert cache (opt-in).
   # `docker compose up glm` runs only this service; see the header for details.

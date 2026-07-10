@@ -642,9 +642,16 @@ the release path.
 
 ### 8.1 Owner-compute prefill
 
-Batch activation matrices and per-selected-slot outputs per layer. Deduplicate
-selected experts across the chunk and retain router-slot identity for the final
-GPU0 reduction. Tune chunk size against:
+**Status: skipped by the owner-compute gate.** Phase 4's isolated decode kernel
+won, but its end-to-end replacement regressed and was reverted. There is no
+validated owner-compute runtime to promote into a permanent prefill semantic
+variant; the profile comparison therefore uses the two release-capable
+architectures plus the single-GPU compatibility baseline.
+
+If owner compute is revisited on different hardware, batch activation matrices
+and per-selected-slot outputs per layer. Deduplicate selected experts across the
+chunk and retain router-slot identity for the final GPU0 reduction. Tune chunk
+size against:
 
 - peer activation bytes;
 - unique expert count;
@@ -653,30 +660,38 @@ GPU0 reduction. Tune chunk size against:
 
 ### 8.2 Compare with whole-layer distribution
 
-Run controlled A/B at prompt lengths 256, 2K, 16K, and 32K:
+**Status: controlled profile screen completed.** Prefill throughput in t/s:
 
-```text
-single-process passive peer cache
-single-process owner-compute
-two-process layer pipeline
-```
+| Prompt | single GPU | passive peer | distributed layers |
+| ---: | ---: | ---: | ---: |
+| 256 | 5.94 | 5.64 | 6.42 |
+| 2K | 26.52 | 30.97 | 33.68 |
+| 16K | 56.96 | 55.18 | 68.08 |
+| 32K | 56.28 | 55.19 | 69.30 |
 
-Choose documented profiles:
+The existing two-process split wins long prompt ingestion by 23.4–25.6% versus
+passive peer at 16K–32K, while passive peer remains the decisive interactive
+decode winner at 4.25 steady t/s versus about 0.14 distributed. Passive peer
+adds no long-prefill benefit over one GPU. Explicit 4096-token distributed
+chunks reproduced the 16K default at 68.33 t/s; 2048-token chunks regressed to
+37.59 t/s and raised disk reads from 673.6 to 1193.7 GiB. Results and
+qualifications are in `speed-bench/v100_prefill_profiles.csv`.
 
-- `interactive`: best decode/latency architecture;
-- `long-prefill`: architecture that wins large prompt ingestion;
-- `single-gpu`: compatibility profile.
+Selected deployment recipes:
 
-These are deployment recipes, not permanent alternate numerical semantics.
+- `interactive`: one process, GPU0 graph, 8 GiB local + 26 GiB GPU1 passive
+  peer cache;
+- `long-prefill`: layers `0:21 | 22:output`, 8 GiB cache per process,
+  4096-token chunks, flow window 3;
+- `single-gpu`: one process on GPU0 with an 8 GiB cache.
 
 ### 8.3 Compose integration
 
-Only after release validation:
-
-- update `docker-compose.yml` with the winning profile;
-- expose only stable capacity knobs;
-- keep diagnostics out of normal compose configuration;
-- document GPU exclusivity and VRAM margins.
+**Status: profiles published.** The unprofiled compose default is now
+`interactive`; `long-prefill` and `single-gpu` are explicit compose profiles,
+and GLM retains its separate profile. Stable cache/chunk capacities are exposed,
+diagnostics remain out of compose, and `RUNNING.md` documents selection, GPU
+exclusivity, VRAM margins, and the distributed decode warning.
 
 ## 9. Phase 8 — optional CPU-host research
 
@@ -742,12 +757,10 @@ commit. Their performance attribution and rollback paths must remain separate.
 The corrected passive-peer profile remains the release path at 4.25 steady
 t/s, Phase 3 runtime policy is skipped, and Phase 4 owner compute is a measured
 end-to-end no-go despite its isolated kernel win. Phase 5 is therefore skipped.
-Phase 6 is complete as a measured no-go: the offline sidecar is valid, but CUDA
-read coalescing missed both I/O gates and regressed decode sharply, so no runtime
-path remains. The next eligible task is **Phase 7, prefill and deployment
-profiles**. GLM fixture validation remains queued until that model is restored.
-
-Keep the passive-peer decode profile unchanged. Phase 7 should begin with
-controlled prefill-only measurements and must not publish deployment defaults
-until a profile passes the correctness and performance gates. Keep the sidecar
-artifact out of normal runtime configuration.
+Phases 0–7 are complete. The published DeepSeek profiles keep passive peer for
+interactive decode, use the existing layer pipeline only for long prefill, and
+retain a single-GPU compatibility option. No rejected cache policy, owner
+compute, or sidecar runtime entered the release path. The next eligible work is
+Phase 8 optional CPU-host research, but only if suitable wired hosts and local
+model storage are available. GLM fixture validation remains queued until that
+model is restored.

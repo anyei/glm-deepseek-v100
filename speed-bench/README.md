@@ -82,7 +82,30 @@ contaminating a canonical result;
 `DS4_ALLOW_BUSY=1` is available only for explicitly non-canonical smoke tests.
 Set `DS4_DRY_RUN=1` to validate and print container commands without occupying
 the GPUs. Performance claims should use at least 96 generated tokens and three
-measured runs; shorter runs are smoke tests only.
+measured runs; shorter runs are smoke tests only. Prefill-only screens can set
+`DS4_GEN_TOKENS=1`. `DS4_PREFILL_CHUNK`, `DS4_DIST_PREFILL_CHUNK`, and
+`DS4_DIST_PREFILL_WINDOW` expose the chunk controls while preserving them in
+run metadata; zero keeps the runtime default.
+
+## Validated V100 deployment profiles
+
+The Phase 7 DeepSeek prefill matrix is in `v100_prefill_profiles.csv`:
+
+| Prompt | single GPU | passive peer | distributed layers |
+| ---: | ---: | ---: | ---: |
+| 256 | 5.94 t/s | 5.64 t/s | 6.42 t/s |
+| 2K | 26.52 t/s | 30.97 t/s | 33.68 t/s |
+| 16K | 56.96 t/s | 55.18 t/s | 68.08 t/s |
+| 32K | 56.28 t/s | 55.19 t/s | 69.30 t/s |
+
+Use passive peer caching for `interactive`: its separately validated steady
+decode result is 4.25 t/s. Use the two-process split for `long-prefill`: it is
+23–26% faster than passive peer at 16K–32K, but distributed decode is only about
+0.14 t/s. Use one V100 as the compatibility `single-gpu` profile. Explicit
+4096-token distributed chunks reproduced the 16K default (68.33 t/s); 2048
+regressed to 37.59 t/s and nearly doubled disk reads. Owner-compute is omitted:
+the Phase 4 end-to-end path failed its gate and was reverted, so it is not a
+deployment candidate.
 
 ## Expert-access traces
 

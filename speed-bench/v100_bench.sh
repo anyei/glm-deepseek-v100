@@ -22,7 +22,8 @@ Common overrides:
   DS4_CTX_START=256 DS4_CTX_MAX=256 DS4_STEP_INCR=256
   DS4_GEN_TOKENS=96 DS4_CACHE=8GB DS4_RUNS=3 DS4_WARMUPS=1
   DS4_WARM_WEIGHTS=1 DS4_TIMEOUT_SEC=1800
-  DS4_READ_THREADS=8
+  DS4_READ_THREADS=8 DS4_PREFILL_CHUNK=0
+  DS4_DIST_PREFILL_CHUNK=0 DS4_DIST_PREFILL_WINDOW=0
   DS4_MIN_CPU_IDLE_PCT=80       refuse a loaded benchmark host
   DS4_MAX_IDLE_GPU_MIB=512      refuse GPUs already holding a workload
   DS4_MAX_SWAP_IO_MIB=256       maximum combined swap I/O per process
@@ -78,6 +79,9 @@ runs=${DS4_RUNS:-3}
 warmups=${DS4_WARMUPS:-1}
 timeout_sec=${DS4_TIMEOUT_SEC:-1800}
 read_threads=${DS4_READ_THREADS:-8}
+prefill_chunk=${DS4_PREFILL_CHUNK:-0}
+dist_prefill_chunk=${DS4_DIST_PREFILL_CHUNK:-0}
+dist_prefill_window=${DS4_DIST_PREFILL_WINDOW:-0}
 warm_weights=${DS4_WARM_WEIGHTS:-1}
 dry_run=${DS4_DRY_RUN:-0}
 hash_model=${DS4_HASH_MODEL:-0}
@@ -92,6 +96,9 @@ for pair in "DS4_CTX_START:$ctx_start" "DS4_CTX_MAX:$ctx_max" \
             "DS4_STEP_INCR:$step_incr" "DS4_GEN_TOKENS:$gen_tokens" \
             "DS4_RUNS:$runs" "DS4_WARMUPS:$warmups" \
             "DS4_TIMEOUT_SEC:$timeout_sec" "DS4_READ_THREADS:$read_threads" \
+            "DS4_PREFILL_CHUNK:$prefill_chunk" \
+            "DS4_DIST_PREFILL_CHUNK:$dist_prefill_chunk" \
+            "DS4_DIST_PREFILL_WINDOW:$dist_prefill_window" \
             "DS4_MIN_CPU_IDLE_PCT:$min_cpu_idle" \
             "DS4_MAX_IDLE_GPU_MIB:$max_idle_gpu_mib" \
             "DS4_MAX_SWAP_IO_MIB:$max_swap_io_mib" \
@@ -165,6 +172,7 @@ common_bench=(
     --ctx-start "$ctx_start" --ctx-max "$ctx_max" --step-incr "$step_incr"
     --gen-tokens "$gen_tokens"
 )
+(( prefill_chunk == 0 )) || common_bench+=(--prefill-chunk "$prefill_chunk")
 [[ "$warm_weights" == 0 ]] || common_bench+=(--warm-weights)
 
 container_common=(
@@ -189,7 +197,10 @@ write_metadata() {
         printf 'model_sha256=%s\n' "$model_sha256"
         printf 'image=%s\nctx_start=%s\nctx_max=%s\nstep_incr=%s\n' "$image" "$ctx_start" "$ctx_max" "$step_incr"
         printf 'gen_tokens=%s\ncache=%s\nruns=%s\nwarmups=%s\n' "$gen_tokens" "$cache" "$runs" "$warmups"
-        printf 'read_threads=%s\nwarm_weights=%s\ntimeout_sec=%s\n' "$read_threads" "$warm_weights" "$timeout_sec"
+        printf 'read_threads=%s\nprefill_chunk=%s\ndist_prefill_chunk=%s\n' \
+            "$read_threads" "$prefill_chunk" "$dist_prefill_chunk"
+        printf 'dist_prefill_window=%s\nwarm_weights=%s\ntimeout_sec=%s\n' \
+            "$dist_prefill_window" "$warm_weights" "$timeout_sec"
         printf 'min_cpu_idle_pct=%s\nmax_idle_gpu_mib=%s\nmax_swap_io_mib=%s\n' \
             "$min_cpu_idle" "$max_idle_gpu_mib" "$max_swap_io_mib"
         printf 'max_swap_io_mib_per_sec=%s\nallow_busy=%s\n' \
@@ -323,6 +334,9 @@ run_distributed() {
         --ctx-start "$ctx_start" --ctx-max "$ctx_max" --step-incr "$step_incr"
         --gen-tokens "$gen_tokens"
         --role coordinator --layers "$coord_layers" --listen "$host" "$coord_port")
+    (( prefill_chunk == 0 )) || coord_cmd+=(--prefill-chunk "$prefill_chunk")
+    (( dist_prefill_chunk == 0 )) || coord_cmd+=(--dist-prefill-chunk "$dist_prefill_chunk")
+    (( dist_prefill_window == 0 )) || coord_cmd+=(--dist-prefill-window "$dist_prefill_window")
     [[ "$warm_weights" == 0 ]] || coord_cmd+=(--warm-weights)
     local -a worker_cmd=(docker run -d --name "$worker" "${container_common[@]}"
         --ipc=host --pid=host --network=host

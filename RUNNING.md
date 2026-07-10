@@ -11,17 +11,16 @@ docker build -t ds4:sm70-ipc .
 Model files live outside the image; mount the directory read-only. The GGUFs
 used below live in a `./models/` directory next to the repo.
 
-## Recommended: both GPUs via docker compose
+## Recommended interactive profile: both GPUs, one process
 
-The compose stack runs the model split across both V100s, with activations
-crossing GPU-to-GPU over NVLink (see VOLTA.md for the internals):
+The default compose service runs the graph on GPU0 and uses GPU1 as a 26 GiB
+passive expert-cache tier over NVLink. This is the validated interactive winner
+for DeepSeek Flash: 4.25 median steady decode t/s versus 2.37 on one V100.
 
 ```sh
 cd glm-deepseek-v100/
 docker compose up -d
-docker compose logs -f     # wait for the model load, then check:
-                           #   "GPU IPC inbox ready"               (worker)
-                           #   "GPU IPC activation path enabled"   (coordinator)
+docker compose logs -f interactive
 curl http://127.0.0.1:8080/v1/models
 ```
 
@@ -37,20 +36,42 @@ curl http://127.0.0.1:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 Tunables (put them in `.env` next to docker-compose.yml, or export them):
 
-| Variable           | Default        | Meaning                              |
-|--------------------|----------------|--------------------------------------|
-| `DS4_MODELS_DIR`   | `../ds4-models`| Host dir containing the GGUF         |
-| `DS4_MODEL`        | Flash IQ2 file | GGUF filename inside that dir        |
-| `DS4_CTX`          | `16384`        | Context tokens                       |
-| `DS4_COORD_CACHE`  | `8GB`          | GPU 0 expert-cache VRAM budget       |
-| `DS4_WORKER_CACHE` | `8GB`          | GPU 1 expert-cache VRAM budget       |
+| Variable                | Default         | Meaning                          |
+|-------------------------|-----------------|----------------------------------|
+| `DS4_MODELS_DIR`        | `../ds4-models` | Host dir containing the GGUF     |
+| `DS4_MODEL`             | Flash IQ2 file  | GGUF filename inside that dir    |
+| `DS4_CTX`               | `16384`         | Context tokens                   |
+| `DS4_INTERACTIVE_CACHE` | `8GB`           | GPU0 expert-cache budget         |
+| `DS4_PEER_CACHE`        | `26`            | GPU1 peer-cache budget in GiB    |
 
-**Size the caches to VRAM that is actually free.** Other containers (e.g. a
-llama.cpp server) may already hold many GiB — check `nvidia-smi` first. If a
-process logs `CUDA tensor alloc failed: out of memory` at startup, lower its
-cache budget.
+**Size the caches to VRAM that is actually free.** Other containers may already
+hold many GiB; check `nvidia-smi` first. Stop with `docker compose down`.
 
-Stop with `docker compose down`.
+## Long-prefill profile: distributed layers
+
+For prefill-heavy or offline jobs, the existing layer split is 23–26% faster
+at 16K–32K prompt ingestion. It is not an interactive profile: distributed
+decode measured about 0.14 t/s. Stop the interactive service, then explicitly
+start only the two profiled services:
+
+```sh
+docker compose down
+docker compose --profile long-prefill up -d coordinator worker
+docker compose logs -f coordinator worker
+# Expect "GPU IPC inbox ready" and "GPU IPC activation path enabled".
+```
+
+The validated split is GPU0 layers `0:21`, GPU1 `22:output`, with 8 GiB expert
+caches, 4096-token prefill chunks, and a three-chunk flow window. A 2048-token
+chunk regressed 16K prefill from 68.3 to 37.6 t/s by rereading substantially
+more expert data.
+
+| Variable                   | Default | Meaning                           |
+|----------------------------|---------|-----------------------------------|
+| `DS4_COORD_CACHE`          | `8GB`   | GPU0 expert-cache budget          |
+| `DS4_WORKER_CACHE`         | `8GB`   | GPU1 expert-cache budget          |
+| `DS4_LONG_PREFILL_CHUNK`   | `4096`  | Session and pipeline chunk tokens |
+| `DS4_LONG_PREFILL_WINDOW`  | `3`     | End-to-end chunks in flight       |
 
 ## GLM 5.2 (single process, GPU0 + GPU1 peer expert cache)
 
@@ -58,7 +79,7 @@ GLM's validated best-decode config is **not** a distributed layer split — it i
 one `ds4-server` on GPU0 that borrows GPU1's VRAM as an expert-cache tier over
 NVLink (`DS4_CUDA_PEER_EXPERT_CACHE_GB`, +12% decode vs a single-GPU cache). It
 is an opt-in compose profile, so the default `docker compose up` still brings up
-the DeepSeek pair. Run only the GLM service with:
+the DeepSeek interactive service. Run only the GLM service with:
 
 ```sh
 docker compose up glm      # runs the glm service (+ deps), not coordinator/worker
@@ -66,7 +87,7 @@ docker compose logs -f glm
 curl http://127.0.0.1:8080/v1/models
 ```
 
-Do not run it alongside the DeepSeek pair — they share port 8080 and want the
+Do not run it alongside a DeepSeek profile — they share port 8080 and want the
 same GPUs; `docker compose down` first. The peer tier needs GPU1's ~26 GB
 actually free, so stop or shrink any llama.cpp server holding it (see VOLTA.md).
 GLM-on-CUDA is on by default; set `DS4_GLM_CUDA_DISABLE=1` to force the old
@@ -80,6 +101,15 @@ Metal-only refusal.
 | `DS4_CTX`               | `16384`                          | Context tokens (shared)         |
 
 ## Single GPU (simpler, no distributed mode)
+
+The compatibility compose profile hides GPU1:
+
+```sh
+docker compose down
+docker compose --profile single-gpu up -d single-gpu
+```
+
+The equivalent direct invocation is:
 
 ```sh
 docker run --rm --gpus '"device=0"' -p 8080:8080 \

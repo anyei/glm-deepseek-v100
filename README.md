@@ -1334,6 +1334,21 @@ sets those requirements and uses `DS4_CUDA_DEVICE=0` for the coordinator and
 
 ### Examples
 
+On the two-V100 DeepSeek host, plain `docker compose up` selects the validated
+interactive profile: GPU0 computes with an 8 GiB local expert cache and GPU1
+supplies a 26 GiB passive peer tier. For prefill-heavy jobs, stop it and start
+the explicit layer pipeline; this is 23–26% faster at 16K–32K ingestion but is
+not suitable for decode:
+
+```sh
+docker compose up -d
+docker compose down
+docker compose --profile long-prefill up -d coordinator worker
+```
+
+See [RUNNING.md](RUNNING.md) and `speed-bench/v100_prefill_profiles.csv` for the
+profile matrix, cache budgets, chunk settings, and single-GPU alternative.
+
 The validated GLM configuration uses GPU 0 for compute and 26 GiB of GPU 1 as
 a peer expert cache. The supplied compose service wires
 `DS4_CUDA_PEER_EXPERT_CACHE_GB` from `DS4_GLM_PEER_CACHE`:
@@ -1390,7 +1405,8 @@ services:
 ```
 
 ```sh
-docker compose -f docker-compose.yml -f compose.tcp.yml up
+docker compose -f docker-compose.yml -f compose.tcp.yml \
+  --profile long-prefill up coordinator worker
 ```
 
 For native runs, place the variables directly before the command:
