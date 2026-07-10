@@ -465,7 +465,7 @@ Normal execution remains unaffected when the environment gate is absent.
 
 ### 5.4 Microbenchmarks
 
-**Isolated gate result: pass; end-to-end replacement gate still pending.** Three
+**Final gate result: no-go; retain passive peer.** Three
 runs each measured 773 all-peer calls. Owner-side means were 0.195–0.206 ms:
 activation/control 0.018–0.024 ms, compute 0.165–0.169 ms, and six-slot return
 0.012–0.013 ms. The matching passive path measured GPU0 MoE plus peer-hit
@@ -474,9 +474,15 @@ canonical join leaves a 26.4–36.1% reduction (35.6% median), above the 15%
 isolated gate. Results are tracked in `speed-bench/v100_peer_owner_probe.csv`.
 A separate shipping direct-sum run measured 0.346 ms for
 peer-copy plus GPU0 MoE, so the comparison is not relying on a slower baseline
-kernel. These are context-16 diagnostic microbenchmarks, not an end-to-end t/s
-claim. Do not start Phase 5 until an actual replacement mode demonstrates no
-token-time regression.
+kernel. However, the actual all-peer replacement A/B consistently regressed
+steady decode: passive peer measured 4.03/4.04/4.05 t/s (4.04 median), while
+replacement measured 3.96/3.99/4.00 (3.99 median), about -1.2%. A fixed-prompt
+8-token logprob dump was byte-identical, proving correctness, but synchronous
+device switching and selected-ID/weight control readbacks consumed the isolated
+kernel gain. Results are tracked in
+`speed-bench/v100_peer_owner_replacement.csv`. The replacement code was reverted;
+only the duplicate diagnostic probe remains. Stop owner-compute work and do not
+start Phase 5 exclusive ownership on this host.
 
 Measure per layer:
 
@@ -500,6 +506,10 @@ by at least 15% on peer hits and does not increase total token time. If it does
 not, stop and retain passive peer caching.
 
 ## 6. Phase 5 — exclusive dual-GPU ownership
+
+**Status: skipped.** Phase 4's end-to-end replacement regressed steady decode by
+about 1.2%, so the prerequisite did not pass. The sections below remain design
+notes only.
 
 Proceed only if Phase 4 passes.
 
@@ -696,13 +706,11 @@ commit. Their performance attribution and rollback paths must remain separate.
 ## 12. Immediate next action
 
 The corrected passive-peer profile remains the release path at 4.25 steady
-t/s, and Phase 3 runtime policy remains skipped. Phase 4's duplicate-compute
-all-peer microbenchmark passed its isolated gate with a 35.6% median reduction
-and exact slot outputs. The next task is a still-gated **DeepSeek decode
-replacement mode** that uses those peer rows in the canonical GPU0 join and
-measures end-to-end token time. Keep it diagnostic and all-peer only. Do not
-start Phase 5 mixed/exclusive ownership unless replacement mode has no token
-regression. GLM fixture validation remains queued until the model is restored.
+t/s, Phase 3 runtime policy is skipped, and Phase 4 owner compute is a measured
+end-to-end no-go despite its isolated kernel win. Phase 5 is therefore skipped.
+The next eligible task is **Phase 6, expert-oriented disk layout**, starting with
+format/tool design and available-space validation before writing an 80+ GiB
+sidecar. GLM fixture validation remains queued until the model is restored.
 
 Do not start peer-owner kernels yet. Capture representative decode traces with
 the new opt-in format, then build the offline simulator before changing cache

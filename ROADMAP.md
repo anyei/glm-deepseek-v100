@@ -128,12 +128,12 @@ can't just be committed blind on numerically-validated shipping code.
 The two efficiency findings below are perf, not cleanup — they belong to §2's
 hot-path work but were surfaced here:
 
-- [ ] **Peer-owner routed MoE** — isolated prototype gate passed 2026-07-10.
-  `DS4_CUDA_PEER_OWNER_PROBE=1` duplicated 773 all-peer calls per run on GPU1,
-  returned canonical per-slot rows with zero delta, and measured 26–36% below
-  peer-weight-copy plus GPU0 MoE after a join allowance. It is still diagnostic
-  duplicate compute. Next: all-peer decode replacement and end-to-end token A/B;
-  do not begin mixed ownership until that passes.
+- [x] **Peer-owner routed MoE research gate** — stopped 2026-07-10. The isolated
+  probe returned exact per-slot rows and measured 26–36% below peer-copy plus
+  GPU0 MoE, but the real replacement regressed median steady decode 4.04 -> 3.99
+  t/s (-1.2%) because synchronous control/device-switch overhead consumed the
+  gain. Logprob A/B was byte-identical. Replacement code was reverted; retain
+  only `DS4_CUDA_PEER_OWNER_PROBE` for research and do not begin mixed ownership.
 
 - [x] **Per-layer allocator churn in the staging path** — completed 2026-07-10.
   `begin_selected_load` / `begin_compact_load` /

@@ -137,7 +137,9 @@ activation/control, peer compute, and slot-return milliseconds and reports
 max/RMS per-slot deltas. Use `DS4_CUDA_MOE_PROFILE=1` plus an expert trace for
 the passive peer-copy/GPU0 baseline. Results are in
 `v100_peer_owner_probe.csv`. This probe performs duplicate work and is not an
-end-to-end owner-compute mode.
+end-to-end owner-compute mode. A replacement experiment was byte-identical but
+regressed steady decode about 1.2%; it was reverted and is recorded in
+`v100_peer_owner_replacement.csv`.
 
 ## Disk read throughput (`io_probe.c`)
 

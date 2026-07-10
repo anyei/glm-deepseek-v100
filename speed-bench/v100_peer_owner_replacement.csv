@@ -1,0 +1,7 @@
+date,run,mode,context_tokens,generated_tokens,gen_tps,steady_tps,qualification
+2026-07-10,1,passive-peer,16,96,4.02,4.05,"One local slot plus 3944 peer slots; direct-sum shipping path."
+2026-07-10,2,passive-peer,16,96,4.01,4.04,"One local slot plus 3944 peer slots; direct-sum shipping path."
+2026-07-10,3,passive-peer,16,96,4.01,4.03,"One local slot plus 3944 peer slots; direct-sum shipping path."
+2026-07-10,1,peer-owner-replacement,16,96,3.98,4.00,"Diagnostic all-peer replacement; byte-identical logprob A/B."
+2026-07-10,2,peer-owner-replacement,16,96,3.94,3.96,"Diagnostic all-peer replacement; byte-identical logprob A/B."
+2026-07-10,3,peer-owner-replacement,16,96,3.96,3.99,"Diagnostic all-peer replacement; byte-identical logprob A/B."

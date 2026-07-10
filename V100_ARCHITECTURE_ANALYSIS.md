@@ -143,8 +143,11 @@ DeepSeek diagnostic computed six peer-owned slots directly on GPU1 and returned
 unreduced rows with exact GPU0 equality. Across three runs its isolated
 activation+compute+return+estimated-join path was 26–36% faster than measured
 peer-weight-copy plus GPU0 MoE, passing the prototype's 15% microbenchmark gate.
-It remains duplicate diagnostic compute, not a deployment claim; end-to-end
-replacement is still required before exclusive ownership.
+The subsequent end-to-end replacement failed: passive peer delivered 4.04
+median steady t/s versus 3.99 for owner replacement (-1.2%), despite
+byte-identical logprobs. Synchronous control/device switching consumed the
+isolated gain, so replacement was reverted and exclusive ownership is a no-go
+on this implementation/host.
 
 Recorded measurements include:
 
