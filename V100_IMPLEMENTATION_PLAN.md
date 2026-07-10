@@ -563,7 +563,7 @@ ownership, and old/new score comparison.
 ### 7.1 Sidecar format
 
 **Status: v1 planner, resumable builder, and verifier implemented; full-size
-construction pending model availability.** `gguf-tools/expert-sidecar.py` parses
+DeepSeek construction and verification completed.** `gguf-tools/expert-sidecar.py` parses
 GGUF v2/v3 metadata and tensor tables, recognizes both DS4 and HF-style routed
 tensor names, computes quantized payload sizes from GGUF block geometry,
 validates every layer's gate/up/down expert count, and lays out aligned
@@ -576,12 +576,12 @@ synced. `--verify` rehashes both source GGUF ranges and sidecar records. A tiny
 synthetic GGUF regression covers planning, building, complete-file recovery,
 verification, and corruption detection.
 
-For the previously available DeepSeek file the planner found 43 layers, 11,008
-experts, 77,913,391,104 payload bytes, and a 77,914,804,224-byte sidecar. That
-model is no longer present on this filesystem, and the GLM symlink is currently
-dangling, so no 78+ GB sidecar has been written. Re-run `--plan`, verify at least
-a 15–20% post-build storage margin, then run `--build` and `--verify` when a
-source model is restored.
+The restored DeepSeek IQ2XXS file produced 43 layers, 11,008 experts,
+77,913,391,104 payload bytes, and a 77,914,804,224-byte sidecar. Construction
+completed in 8m57s and full source/sidecar verification completed in 7m33s on
+2026-07-10. The result leaves about 98 GiB free (36% of the filesystem), above
+the required storage margin. The GLM symlink remains dangling, so GLM format
+and fixture validation are still pending.
 
 Implement an offline tool that copies exact expert tensor bytes into an
 O_DIRECT-friendly sidecar:
@@ -607,9 +607,22 @@ Requirements:
 
 ### 7.2 Read coalescing
 
-Modify staging so one expert miss can be served by one contiguous read when the
-sidecar is present. Upload subranges to final owner buffers without extra
-copies where alignment permits.
+**Status: prototyped, measured, rejected, and reverted.** The CUDA prototype
+validated the v1 identity/directory against the open GGUF, used O_DIRECT on the
+sidecar, replaced each three-range gate/up/down miss with one contiguous read,
+scattered its pinned staging payload directly to final GPU buffers, and fell
+back to normal GGUF reads when absent or rejected. A 16-token old/new logprob
+A/B was byte-identical.
+
+The one-run context-256 gate smoke was decisively negative. Relative to normal
+GGUF ranges, the sidecar reduced block-device reads only 13.2% (471,631 to
+409,556), increased average request size 17.0% (448.67 to 525.10 KiB), increased
+read service time 13.4% (869,482 to 985,784 ms), and increased bytes read from
+201.80 to 205.09 GiB. Steady decode fell from 2.56 to 1.87 t/s (-27.0%); overall
+generation fell from 1.79 to 1.42 t/s (-20.7%). The prototype therefore missed
+both the 10% read-time and 20% I/O-count gates and was removed from the runtime.
+Raw summary metrics are preserved in `speed-bench/v100_sidecar_probe.csv`; the
+verified sidecar and offline tool remain experimental.
 
 ### 7.3 Benchmark
 
@@ -729,11 +742,12 @@ commit. Their performance attribution and rollback paths must remain separate.
 The corrected passive-peer profile remains the release path at 4.25 steady
 t/s, Phase 3 runtime policy is skipped, and Phase 4 owner compute is a measured
 end-to-end no-go despite its isolated kernel win. Phase 5 is therefore skipped.
-The next eligible task is **Phase 6.1 full-size sidecar construction and
-verification** once a source model is restored, followed by Phase 6.2 read
-coalescing behind normal-GGUF fallback. GLM fixture validation remains queued
-until the model is restored.
+Phase 6 is complete as a measured no-go: the offline sidecar is valid, but CUDA
+read coalescing missed both I/O gates and regressed decode sharply, so no runtime
+path remains. The next eligible task is **Phase 7, prefill and deployment
+profiles**. GLM fixture validation remains queued until that model is restored.
 
-Do not start peer-owner kernels yet. Capture representative decode traces with
-the new opt-in format, then build the offline simulator before changing cache
-policy or ownership.
+Keep the passive-peer decode profile unchanged. Phase 7 should begin with
+controlled prefill-only measurements and must not publish deployment defaults
+until a profile passes the correctness and performance gates. Keep the sidecar
+artifact out of normal runtime configuration.

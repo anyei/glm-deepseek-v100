@@ -1,0 +1,3 @@
+date,mode,context_tokens,generated_tokens,prefill_tps,gen_tps,steady_tps,read_ops,read_gib,read_ms,avg_read_kib,qualification
+2026-07-10,gguf-ranges,256,32,5.91,1.79,2.56,471631,201.80,869482,448.67,"Pre-sidecar cd37f43 binary; one non-canonical gate smoke."
+2026-07-10,expert-sidecar-v1,256,32,6.18,1.42,1.87,409556,205.09,985784,525.10,"Runtime coalescing prototype; byte-identical 16-token logprob A/B; rejected and reverted."

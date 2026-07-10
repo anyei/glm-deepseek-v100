@@ -51,6 +51,13 @@ its completed directory entries, and final publication occurs only after the
 complete header and directory are synced. `--verify` rehashes both the GGUF
 source ranges and sidecar payloads.
 
+The 77.9 GB DeepSeek IQ2XXS sidecar was built and fully verified on 2026-07-10.
+A CUDA coalesced-read prototype remained byte-identical but reduced read
+operations only 13.2%, increased block-device read service time 13.4%, and
+regressed steady decode 27.0%. It failed the runtime gate and was reverted;
+sidecars remain an offline/experimental facility rather than a release-path
+requirement. See `speed-bench/v100_sidecar_probe.csv`.
+
 ## Build
 
 ```sh
