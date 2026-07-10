@@ -52,7 +52,15 @@ Short seven-token samples are smoke tests, not optimization evidence.
 
 ### 1.1 Storage remediation
 
-Current `/mnt/full-models` free space is about 6.8 GiB (98% used). Before
+**Status: remediated for DeepSeek on 2026-07-10.** `/mnt/full-models` now has
+about 171 GiB free after copying and byte-comparing the 86,720,111,200-byte
+DeepSeek model onto it. Its SHA-256 is
+`31598c67c8b8744d3bcebcd19aa62253c6dc43cef3b8adf9f593656c9e86fd8c`.
+A cold O_DIRECT 16 MiB/QD4 probe measured 3.14 GB/s; a deterministic QD1
+scattered 4 MiB probe measured 582 MiB/s. The GLM file formerly in this tree is
+no longer present, so its sweep remains blocked on model availability.
+
+Current `/mnt/full-models` free space was about 6.8 GiB (98% used). Before
 creating new model layouts:
 
 - free or relocate enough data to leave at least 15–20% NVMe free;
@@ -68,6 +76,16 @@ creating new model layouts:
 expert-pattern probe is recorded.
 
 ### 1.2 Memory remediation
+
+**Status: host headroom is sufficient for DeepSeek baselines.** About 21 GiB is
+available and the GPUs are normally idle. Approximately 23 GiB of old dormant
+swap remains in use, but the observed benchmark delta was only 25 pages
+(100 KiB), not active memory pressure. The harness rechecks state before every
+process and rejects more than 16 MiB during a one-second preflight or 256 MiB
+over a complete process. The observed 117 MiB during a model warm-up was only
+about 0.05% of its backing-device reads while 21 GiB RAM remained available;
+the exact-zero rule incorrectly classified that low-rate traffic as active
+pressure. Do not run `swapoff -a` without enough RAM.
 
 - stop unrelated model processes;
 - verify swap-in/swap-out (`vmstat 1`) is zero during benchmarks;
@@ -117,6 +135,22 @@ range to distinguish a 10% change.
 
 ### 2.1 VRAM envelope sweep
 
+**Status: provisional DeepSeek geometry probe completed; canonical sweep
+blocked by storage remediation.** A 2026-07-10 one-token/context-16 probe (not a
+performance measurement) confirmed why the live slot count must be recorded.
+With the default 16 GiB runtime reserve, requested local budgets of
+8/12/16/20/24/26 GiB planned 701/1308/1915/2522/3128/3432 slots but were
+live-capped to only 415–553 slots after resident tensors loaded. With an 8 GiB
+local request, peer requests of 8/16/24/26 GiB allocated
+1213/2427/3640/3944 slots. All probes completed without OOM. Peak VRAM and
+backing-device read bytes are now included in `v100_compare.py` summaries so the
+canonical rerun records these resources alongside throughput. Raw probe runs
+remain under ignored `speed-bench/local-runs/`.
+
+Do not interpret the one-token rates or peak VRAM from this probe: the cache was
+not filled. Both model filesystems remain 98–99% full, so the storage gate in
+Phase 0 still blocks canonical performance results.
+
 For each model/context, sweep the local expert budget upward until the live
 memory cap or OOM margin is reached. Record actual allocated slots, not only the
 requested GB value.
@@ -138,6 +172,29 @@ Do not combine the host L2 in canonical runs.
 
 ### 2.2 Architecture A/B
 
+**Status: DeepSeek context-256 decode decision completed on 2026-07-10.** The
+tracked results are in `speed-bench/v100_architecture.csv`. With 96 generated
+tokens, the 8 GiB local-cache profile reached median 2.37 steady t/s (two clean
+samples at 2.37–2.40 and one storage-latency outlier at 0.94). The first passive
+peer result reached 3.77 t/s, but tracing later proved a grow-condition bug had
+left only about 3 local slots beside 3,944 peer slots; the summary parser had
+incorrectly reported the planned 701 local slots. Comparing grow targets against
+`local_capacity` rather than combined capacity restored 701+3,944 slots. Three
+clean fixed runs reached median 4.25 steady t/s (4.10–4.26), +12.7% over the
+superseded peer run and +79% over the single-GPU median. The fixed run traded
+-4.6% prefill and +13% first-token latency for that decode gain; backing reads
+were essentially flat at 209.12 GiB. The old row remains in the CSV as
+`peer-grow-bug`; `peer-fixed` is the production result.
+
+The distributed layer split completed one full 96-token screening run at only
+0.14 steady t/s, about 27x slower than passive peer, while reading about 980 GiB
+across its two processes. Repeating that approximately 11-minute losing run
+three times could not plausibly satisfy the +10% gate, so it was stopped as an
+explicit no-go rather than consuming another 30–40 minutes. This row is marked
+`warmup_screen`, not a three-sample canonical measurement. Passive peer remains
+the production decode default. The GLM comparison is unavailable because its
+local model was deliberately removed during storage remediation.
+
 Benchmark on identical prompts:
 
 1. one V100 + SSD;
@@ -147,8 +204,10 @@ Benchmark on identical prompts:
 DeepSeek already supports all three. GLM first compares 1 and 2; whole-layer
 GLM distribution is a later independent experiment.
 
-**Deliverable:** `speed-bench/v100_architecture.csv` plus a short interpretation
-in the analysis document or `VOLTA.md`.
+**Deliverable: completed for the available DeepSeek model.**
+`speed-bench/v100_architecture.csv` plus this interpretation; broader context
+lengths remain future workload characterization rather than a blocker for the
+architecture decision.
 
 **Decision:** passive peer cache remains production default unless layer split
 wins steady decode by at least 10% without unacceptable first-token or prefill
@@ -159,6 +218,19 @@ regressions.
 This phase should not alter kernel math.
 
 ### 3.1 Expert trace format
+
+**Status: implemented (2026-07-10).** Set `DS4_CUDA_EXPERT_TRACE` to an output
+path to enable the compact CSV; it is fully disabled by default and bounded to
+one million rows (`DS4_CUDA_EXPERT_TRACE_MAX_ROWS`).
+`DS4_CUDA_EXPERT_TRACE_MODEL_ID` places a caller-supplied model hash/name in the
+header. Rows preserve router-slot IDs and report logical token epoch, layer,
+expert, GPU/peer/host/SSD tier, final owner, hit/miss, victim ID/age, uniquely
+accounted read bytes, batched-read latency, classify/peer-copy time, total stage
+time, model bytes, and cache geometry. Batch timing is repeated on its member
+rows, while read bytes are emitted only on the first row for each compact expert
+so summing bytes does not overcount prefill deduplication. A CUDA `sm_70` build
+and an end-to-end 9,288-row DeepSeek smoke passed. Raw traces remain outside
+git.
 
 Add an opt-in binary or compact CSV trace capturing:
 
@@ -179,6 +251,18 @@ cache geometry in the header.
 
 ### 3.2 Remove allocator churn
 
+**Status: implemented and smoke-gated (2026-07-10).** CUDA staging now owns one
+process/session scratch object whose read descriptors, fill/direct lists,
+expert-to-slot map, compact IDs, slot IDs, retry descriptors, and optional trace
+buffers retain capacity across routed layers. DeepSeek built for `sm_70` and ran
+end to end. A before/after trace comparison matched all 9,288 rows exactly for
+call/token/layer/router slot, expert, tier, owner, hit/miss, victim/age, uniquely
+accounted bytes, model identity, and cache geometry, with total read bytes
+unchanged at 16,031,416,320. This directly verifies unchanged cache
+classification and staging semantics; timing fields were intentionally excluded
+from equality. A longer numerical/performance A/B remains required before a
+release claim.
+
 Hoist per-layer staging vectors into reusable process/session scratch storage:
 
 - selected IDs;
@@ -196,6 +280,17 @@ change only if allocation count and/or CPU staging time falls measurably.
 
 ### 3.3 Remove redundant decode D2H synchronization
 
+**Status: implemented; GLM runtime validation pending model availability.**
+GLM's early selected-load API already performs the necessary router-ID readback
+and now leaves an authoritative host record tied to model/layer/count. Both the
+generic and typed GLM routed-MoE launchers consume that record without repeating
+the blocking D2H copy on every decode layer. Prefill or a missing record still
+reads and stages safely. `DS4_CUDA_STREAM_SELECTED_ID_CROSSCHECK=1` re-enables
+the old GPU readback as a diagnostic comparison and fails loudly on mismatch.
+The CUDA `sm_70` build and DeepSeek regression smoke pass. The expected removal
+is one blocking synchronization per GLM routed decode layer; measurement and
+the full GLM fixture cannot run until that deleted model is restored.
+
 Thread already-known host router IDs through the staging API instead of reading
 selected IDs back from the GPU solely for validation. Preserve a diagnostic
 cross-check mode that compares host/GPU IDs.
@@ -206,6 +301,19 @@ routed layer is removed.
 
 ### 3.4 Hash the local GPU cache index
 
+**Status: implemented and trace-gated (2026-07-10).** The GPU/peer expert cache
+now has an `unordered_map` keyed by the full model pointer/size, layer, total
+expert count, expert ID, all three tensor offsets, and expert geometry. Every
+indexed hit is revalidated against authoritative slot metadata; stale entries
+are erased and become misses. Victim keys are removed before reuse, eager batch
+reservations are indexed immediately, invalidation clears the directory, and an
+allocation failure disables the index and safely falls back to the original
+scan. Cache teardown was also changed from an unsafe `memset` over C++ container
+members to value assignment. A 9,288-row before/after DeepSeek trace matched
+hit/miss, tier, owner, victim/age, and all 16,031,416,320 read bytes exactly.
+A passive-peer smoke exercised 4,471 peer hits and 5,604 peer-owned rows with no
+errors.
+
 The host L2 already uses a hash index; the GPU expert cache still scans slots.
 Add a host metadata index keyed by full model/layer/expert identity and verify
 the slot record on every hit. Keep LRU metadata authoritative.
@@ -215,6 +323,29 @@ the slot record on every hit. Keep LRU metadata authoritative.
 ## 4. Phase 3 — policy simulation before policy implementation
 
 ### 4.1 Offline simulator
+
+**Status: baseline replay and initial policies implemented (2026-07-10).**
+`speed-bench/expert-cache-sim.py` groups rows by staging call, deduplicates
+router slots, and replays unique experts in the runtime's ascending compact-ID
+order. It reports hits, misses, byte reads, evictions, layer counters, and owner
+admission/residency. Exact LRU reproduced both validation traces exactly:
+7,023/2,265 hits/misses and 16,031,416,320 bytes for local-only, and
+6,938/1,834 with 12,980,846,592 bytes for passive peer. Alternatives are
+explicitly marked untrusted by a nonzero exit unless this baseline matches.
+Segmented LRU, TinyLFU admission, owner-balanced placement, equal per-layer
+quotas, decode-protected/prefill-ephemeral regions, optional top-K replication,
+capacity overrides, reuse-distance percentiles, phase counters, and per-layer
+reports are available.
+
+A context-256/96-generated-token passive-peer trace (181,632 rows) exposed and
+then validated the local-grow fix above. With the corrected 701+3,944 geometry,
+exact LRU reproduced 45,472 hits, 16,466 misses, and 116,544,503,808 bytes. No
+candidate reduced bytes: segmented LRU, TinyLFU, decode protection,
+owner-balanced placement and replication tied baseline, while equal per-layer
+quotas regressed bytes by 1.38%. There were no evictions under the useful
+policies and prefill used no global cache, so this workload has neither capacity
+pressure nor prefill pollution to fix. The required 20% runtime-policy gate
+fails decisively; do not add a runtime policy for this trace.
 
 Create `speed-bench/expert-cache-sim.py` consuming the Phase 2 trace. Simulate
 combined GPU capacities and report:
@@ -241,6 +372,13 @@ alternatives are trusted.
 
 ### 4.2 Select policy by bytes, not hit count alone
 
+**Decision: no runtime policy change for the measured DeepSeek workload.** The
+corrected representative peer trace predicts 0% byte reduction from the best
+alternative, far below the 20% gate; per-layer quotas are actively worse. Keep
+exact LRU and avoid adding policy metadata/CPU cost. Revisit only with a longer
+or materially different trace (larger context, another model, or demonstrated
+eviction pressure).
+
 Experts currently have uniform geometry within a model variant, but the design
 should calculate byte cost. Select the simplest policy achieving most of the
 simulated reduction. Reject policies whose metadata/decision cost approaches
@@ -250,6 +388,8 @@ the expected savings.
 on a representative decode trace or a clear prefill-pollution fix.
 
 ### 4.3 Runtime policy
+
+**Status: skipped by gate.** No measured policy qualifies for implementation.
 
 Implement behind a diagnostic environment gate initially, then remove the gate
 once one release path is selected. Do not retain permanent semantic variants.
@@ -522,12 +662,14 @@ commit. Their performance attribution and rollback paths must remain separate.
 
 ## 12. Immediate next action
 
-The next task is the **Phase 1 architecture/cache sweep** using the completed
-harness. Do not record canonical performance until its idle-host preflight
-passes. The sweep provides the baseline needed to decide whether owner-side
-compute, cache policy, or disk layout is the first implementation win for
-DeepSeek on this exact host.
+The DeepSeek Phase 1 decision, Phase 2 hot-path work, and Phase 3 policy
+simulation are complete. The corrected passive-peer profile is the release
+path at 4.25 steady t/s. Phase 3's runtime-policy gate failed (0% best byte
+reduction), so skip Phase 3.3. The next gated task is **Phase 4's narrow
+peer-owner compute prototype** only if its microbenchmark can beat passive
+peer-copy by 15%; do not begin broad exclusive-ownership refactoring first.
+GLM fixture validation remains queued until the model is restored.
 
-Do not start by writing peer kernels. First compare the current three
-architectures reproducibly, then capture expert traces that can prove a cache
-policy before placing it in the hot path.
+Do not start peer-owner kernels yet. Capture representative decode traces with
+the new opt-in format, then build the offline simulator before changing cache
+policy or ownership.

@@ -126,6 +126,20 @@ admission and expert bytes dominate GLM decode.
 
 ## 4. Evidence from the current tree
 
+**Post-analysis measurement update (2026-07-10):** the controlled DeepSeek
+context-256/96-token sweep selected passive peer caching. Single GPU reached
+2.37 median steady t/s; the corrected 8 GiB local + 26 GiB peer profile reached
+4.25 (4.10–4.26), +79%. The initial peer result of 3.77 was superseded after an
+expert trace found that a grow check compared the local target against combined
+capacity and left only about 3 local slots beside 3,944 peer slots. Restoring
+701+3,944 slots improved steady decode another 12.7%. Whole-layer distribution
+screened at 0.14 t/s and is a decode no-go. A 181,632-row policy trace exactly
+replayed 45,472 hits, 16,466 misses and 116,544,503,808 bytes; none of segmented
+LRU, TinyLFU, equal layer quotas, decode protection, owner balancing, or top-K
+replication reduced bytes, so runtime cache-policy work fails its 20% gate on
+this workload. See `speed-bench/v100_architecture.csv` and
+`V100_IMPLEMENTATION_PLAN.md` for qualifications.
+
 Recorded measurements include:
 
 - DeepSeek Flash, one V100, 8 GiB streaming budget: 2.28–2.37 t/s reference

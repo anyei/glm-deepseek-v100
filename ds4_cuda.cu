@@ -171,6 +171,40 @@ struct cuda_stream_expert_cache_slot {
     uint64_t age;
 };
 
+struct cuda_stream_expert_cache_key {
+    const void *model_map;
+    uint64_t model_size;
+    uint32_t layer;
+    uint32_t n_total_expert;
+    uint32_t expert;
+    uint64_t gate_offset;
+    uint64_t up_offset;
+    uint64_t down_offset;
+    uint64_t gate_expert_bytes;
+    uint64_t down_expert_bytes;
+    bool operator==(const cuda_stream_expert_cache_key &o) const {
+        return model_map == o.model_map && model_size == o.model_size &&
+               layer == o.layer && n_total_expert == o.n_total_expert &&
+               expert == o.expert && gate_offset == o.gate_offset &&
+               up_offset == o.up_offset && down_offset == o.down_offset &&
+               gate_expert_bytes == o.gate_expert_bytes &&
+               down_expert_bytes == o.down_expert_bytes;
+    }
+};
+struct cuda_stream_expert_cache_key_hash {
+    size_t operator()(const cuda_stream_expert_cache_key &k) const {
+        size_t h = (size_t)(uintptr_t)k.model_map;
+#define DS4_CACHE_HASH_MIX(v) h ^= (size_t)(v) + (size_t)0x9e3779b9u + (h << 6) + (h >> 2)
+        DS4_CACHE_HASH_MIX(k.model_size); DS4_CACHE_HASH_MIX(k.layer);
+        DS4_CACHE_HASH_MIX(k.n_total_expert); DS4_CACHE_HASH_MIX(k.expert);
+        DS4_CACHE_HASH_MIX(k.gate_offset); DS4_CACHE_HASH_MIX(k.up_offset);
+        DS4_CACHE_HASH_MIX(k.down_offset); DS4_CACHE_HASH_MIX(k.gate_expert_bytes);
+        DS4_CACHE_HASH_MIX(k.down_expert_bytes);
+#undef DS4_CACHE_HASH_MIX
+        return h;
+    }
+};
+
 struct cuda_stream_expert_cache {
     int valid;
     uint32_t capacity;
@@ -195,6 +229,9 @@ struct cuda_stream_expert_cache {
     char    *peer_up_ptr;
     char    *peer_down_ptr;
     std::vector<cuda_stream_expert_cache_slot> slots;
+    std::unordered_map<cuda_stream_expert_cache_key, uint32_t,
+                       cuda_stream_expert_cache_key_hash> index;
+    int index_enabled;
 };
 
 static std::vector<cuda_model_range> g_model_ranges;
@@ -1478,8 +1515,7 @@ static void cuda_stream_expert_cache_release_all(void) {
     if (g_stream_expert_cache.peer_down_ptr) {
         (void)cudaFree(g_stream_expert_cache.peer_down_ptr);
     }
-    g_stream_expert_cache.slots.clear();
-    memset(&g_stream_expert_cache, 0, sizeof(g_stream_expert_cache));
+    g_stream_expert_cache = cuda_stream_expert_cache();
 }
 
 /* Slot address helpers: slot indices below local_capacity address the local
@@ -1515,6 +1551,7 @@ static void cuda_stream_expert_cache_invalidate(void) {
     for (cuda_stream_expert_cache_slot &slot : g_stream_expert_cache.slots) {
         slot.valid = 0;
     }
+    g_stream_expert_cache.index.clear();
     g_stream_expert_cache.valid = 0;
     g_stream_expert_cache.count = 0;
     g_stream_expert_cache.tick = 0;
@@ -2549,8 +2586,8 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
         cuda_stream_expert_cache_release_all();
     }
     if (same_dims &&
-        g_stream_expert_cache.capacity != 0 &&
-        g_stream_expert_cache.capacity >= target_cap &&
+        g_stream_expert_cache.local_capacity != 0 &&
+        g_stream_expert_cache.local_capacity >= target_cap &&
         g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity) {
         return &g_stream_expert_cache;
     }
@@ -2580,8 +2617,9 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
     if (same_dims &&
         g_stream_expert_cache.capacity != 0 &&
         g_stream_expert_cache.slots.size() == g_stream_expert_cache.capacity &&
-        (cap <= g_stream_expert_cache.capacity ||
-         cap - g_stream_expert_cache.capacity < g_stream_expert_cache.capacity / 4u)) {
+        (cap <= g_stream_expert_cache.local_capacity ||
+         cap - g_stream_expert_cache.local_capacity <
+             g_stream_expert_cache.local_capacity / 4u)) {
         return &g_stream_expert_cache;
     }
     if (cap == 0) return NULL;
@@ -2652,6 +2690,8 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
 
         try {
             g_stream_expert_cache.slots.resize(cap + peer_cap);
+            g_stream_expert_cache.index.reserve(cap + peer_cap);
+            g_stream_expert_cache.index_enabled = 1;
         } catch (...) {
             fprintf(stderr, "ds4: CUDA streaming expert cache metadata allocation failed\n");
             (void)cudaFree(gate_ptr);
@@ -2684,9 +2724,49 @@ static cuda_stream_expert_cache *cuda_stream_expert_cache_prepare(
             (uint64_t)cap * gate_expert_bytes;
         g_stream_expert_cache.down_capacity =
             (uint64_t)cap * down_expert_bytes;
+        fprintf(stderr,
+                "ds4: CUDA expert cache allocated: local=%u peer=%u total=%u slots\n",
+                cap, peer_cap, cap + peer_cap);
         return &g_stream_expert_cache;
     }
     return NULL;
+}
+
+static cuda_stream_expert_cache_key cuda_stream_expert_key(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        uint32_t n_total_expert, uint32_t expert, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes) {
+    return { model_map, model_size, layer, n_total_expert, expert,
+             gate_offset, up_offset, down_offset, gate_expert_bytes,
+             down_expert_bytes };
+}
+
+static cuda_stream_expert_cache_key cuda_stream_expert_slot_key(
+        const cuda_stream_expert_cache_slot &slot) {
+    return cuda_stream_expert_key(slot.model_map, slot.model_size, slot.layer,
+            slot.n_total_expert, slot.expert, slot.gate_offset, slot.up_offset,
+            slot.down_offset, slot.gate_expert_bytes, slot.down_expert_bytes);
+}
+
+static void cuda_stream_expert_cache_index_slot(
+        cuda_stream_expert_cache *cache, uint32_t slot) {
+    if (!cache || !cache->index_enabled || slot >= cache->slots.size() ||
+        !cache->slots[slot].valid) return;
+    try {
+        cache->index[cuda_stream_expert_slot_key(cache->slots[slot])] = slot;
+    } catch (...) {
+        cache->index.clear();
+        cache->index_enabled = 0;
+        fprintf(stderr, "ds4: CUDA expert cache index disabled after allocation failure\n");
+    }
+}
+
+static void cuda_stream_expert_cache_unindex_slot(
+        cuda_stream_expert_cache *cache, uint32_t slot) {
+    if (!cache || !cache->index_enabled || slot >= cache->slots.size() ||
+        !cache->slots[slot].valid) return;
+    cache->index.erase(cuda_stream_expert_slot_key(cache->slots[slot]));
 }
 
 static int cuda_stream_expert_cache_find(
@@ -2702,21 +2782,24 @@ static int cuda_stream_expert_cache_find(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
     if (!cache || !cache->valid) return -1;
+    const cuda_stream_expert_cache_key key = cuda_stream_expert_key(
+            model_map, model_size, layer, n_total_expert, expert, gate_offset,
+            up_offset, down_offset, gate_expert_bytes, down_expert_bytes);
+    if (cache->index_enabled) {
+        const auto found = cache->index.find(key);
+        if (found == cache->index.end()) return -1;
+        const uint32_t i = found->second;
+        /* LRU slot metadata remains authoritative. Verify every indexed hit
+         * so stale/corrupt metadata can only become a miss, never a false hit. */
+        if (i < cache->capacity && i < cache->slots.size() &&
+            cache->slots[i].valid &&
+            cuda_stream_expert_slot_key(cache->slots[i]) == key) return (int)i;
+        cache->index.erase(found);
+        return -1;
+    }
     for (uint32_t i = 0; i < cache->capacity; i++) {
         const cuda_stream_expert_cache_slot &slot = cache->slots[i];
-        if (slot.valid &&
-            slot.model_map == model_map &&
-            slot.model_size == model_size &&
-            slot.layer == layer &&
-            slot.n_total_expert == n_total_expert &&
-            slot.expert == expert &&
-            slot.gate_offset == gate_offset &&
-            slot.up_offset == up_offset &&
-            slot.down_offset == down_offset &&
-            slot.gate_expert_bytes == gate_expert_bytes &&
-            slot.down_expert_bytes == down_expert_bytes) {
-            return (int)i;
-        }
+        if (slot.valid && cuda_stream_expert_slot_key(slot) == key) return (int)i;
     }
     return -1;
 }
@@ -2807,6 +2890,7 @@ static int cuda_stream_expert_cache_load_slot(
                 "cached moe_down")) {
         return 0;
     }
+    cuda_stream_expert_cache_unindex_slot(cache, slot);
     cuda_stream_expert_cache_slot &entry = cache->slots[slot];
     entry.valid = 1;
     entry.model_map = model_map;
@@ -2820,6 +2904,7 @@ static int cuda_stream_expert_cache_load_slot(
     entry.gate_expert_bytes = gate_expert_bytes;
     entry.down_expert_bytes = down_expert_bytes;
     entry.age = ++cache->tick;
+    cuda_stream_expert_cache_index_slot(cache, slot);
     return 1;
 }
 
@@ -3854,6 +3939,83 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
     return 1;
 }
 
+/* Optional compact expert-access trace. DS4_CUDA_EXPERT_TRACE names the CSV
+ * output file; disabled means no file, allocations, or hot-path formatting. */
+struct cuda_expert_trace_state {
+    int checked;
+    FILE *file;
+    uint64_t rows;
+    uint64_t max_rows;
+    uint64_t call;
+    uint64_t token_base;
+    uint32_t previous_layer;
+    uint32_t previous_tokens;
+    int have_previous;
+};
+static cuda_expert_trace_state g_expert_trace;
+
+struct cuda_expert_trace_item {
+    const char *tier;
+    const char *owner;
+    int hit;
+    int32_t victim;
+    uint64_t victim_age;
+    uint64_t bytes_read;
+};
+
+/* Process/session staging scratch. These vectors are cleared logically but
+ * retain capacity across routed layers, avoiding allocator traffic in decode. */
+struct cuda_stream_staging_scratch {
+    std::vector<cuda_stream_read_item> load_items;
+    std::vector<cuda_stream_read_item> retry_items;
+    std::vector<uint32_t> fill_compact;
+    std::vector<uint32_t> fill_slot;
+    std::vector<uint8_t> fill_append;
+    std::vector<uint32_t> direct_compact;
+    std::vector<int32_t> expert_to_slot;
+    std::vector<int32_t> compact_ids;
+    std::vector<int32_t> slot_ids;
+    std::vector<cuda_expert_trace_item> trace_items;
+    std::vector<uint8_t> trace_accounted;
+};
+static cuda_stream_staging_scratch g_stream_staging_scratch;
+
+static void cuda_expert_trace_close(void) {
+    if (g_expert_trace.file) fclose(g_expert_trace.file);
+    g_expert_trace.file = NULL;
+}
+
+static int cuda_expert_trace_enabled(void) {
+    if (g_expert_trace.checked) return g_expert_trace.file != NULL;
+    g_expert_trace.checked = 1;
+    const char *path = getenv("DS4_CUDA_EXPERT_TRACE");
+    if (!path || !path[0]) return 0;
+    g_expert_trace.max_rows = 1000000;
+    const char *limit = getenv("DS4_CUDA_EXPERT_TRACE_MAX_ROWS");
+    if (limit && limit[0]) {
+        char *end = NULL;
+        unsigned long long value = strtoull(limit, &end, 10);
+        if (end != limit && end && *end == '\0' && value != 0) {
+            g_expert_trace.max_rows = (uint64_t)value;
+        }
+    }
+    g_expert_trace.file = fopen(path, "wb");
+    if (!g_expert_trace.file) {
+        fprintf(stderr, "ds4: cannot open CUDA expert trace %s: %s\n",
+                path, strerror(errno));
+        return 0;
+    }
+    const char *model_id = getenv("DS4_CUDA_EXPERT_TRACE_MODEL_ID");
+    if (!model_id || !model_id[0]) model_id = "unknown";
+    fprintf(g_expert_trace.file,
+            "# ds4_cuda_expert_trace_v1 device=%d max_rows=%llu model_id=%s\n"
+            "call,token,layer,router_slot,expert,tier,owner,hit,victim,victim_age,bytes_read,classify_copy_us,batch_read_us,slot_upload_us,stage_us,model_bytes,cache_slots,local_slots\n",
+            g_cuda_device, (unsigned long long)g_expert_trace.max_rows,
+            model_id);
+    atexit(cuda_expert_trace_close);
+    return 1;
+}
+
 /* Aggregate staging-phase timing (DS4_CUDA_STREAM_STAGE_TIMING=1): where
  * the per-call wall time of begin_compact_load goes, printed at exit. */
 static struct {
@@ -3927,7 +4089,10 @@ static int cuda_stream_selected_cache_begin_compact_load(
         uint64_t       gate_expert_bytes,
         uint64_t       down_expert_bytes,
         int            strict_failure,
-        int            allow_global_cache) {
+        int            allow_global_cache,
+        const int32_t  *trace_ids,
+        uint32_t        trace_n_tokens,
+        uint32_t        trace_n_selected) {
     cuda_stream_selected_cache_invalidate();
     cuda_model_load_progress_finish();
     const int stage_timing = cuda_stream_stage_timing_enabled();
@@ -4009,17 +4174,48 @@ static int cuda_stream_selected_cache_begin_compact_load(
     const int host_cache =
         !expert_cache_disabled &&
         cuda_host_expert_cache_prepare(gate_expert_bytes, down_expert_bytes);
+    const int trace_on = cuda_expert_trace_enabled() &&
+        g_expert_trace.rows < g_expert_trace.max_rows && trace_ids &&
+        trace_n_tokens != 0 && trace_n_selected != 0 &&
+        (uint64_t)trace_n_tokens * trace_n_selected == slot_count;
+    const double trace_started = trace_on ? cuda_wall_sec() : 0.0;
+    double trace_read_ms = 0.0;
+    double trace_upload_us = 0.0;
+    std::vector<cuda_expert_trace_item> &trace_items =
+        g_stream_staging_scratch.trace_items;
+    std::vector<uint8_t> &trace_accounted =
+        g_stream_staging_scratch.trace_accounted;
+    trace_items.clear();
+    trace_accounted.clear();
+    if (trace_on) {
+        try {
+            trace_items.assign(compact_count,
+                { "direct", "none", 0, -1, 0, 0 });
+            trace_accounted.assign(compact_count, 0);
+        } catch (...) {
+            return strict_failure ? 0 : 1;
+        }
+    }
 
     /* Classify every compact expert up front, then load all misses in one
      * parallel batch: hits are D2D-copied immediately, cache misses reserve
      * an LRU slot (metadata written eagerly so later reservations in the
      * same batch cannot pick the same victim) and batch-load into it, and
      * direct loads batch straight into the compact buffers. */
-    std::vector<cuda_stream_read_item> load_items;
-    std::vector<uint32_t> fill_compact;   /* compact idx per cache-slot miss */
-    std::vector<uint32_t> fill_slot;      /* reserved slot per cache-slot miss */
-    std::vector<uint8_t>  fill_append;
-    std::vector<uint32_t> direct_compact; /* compact idx per direct load */
+    std::vector<cuda_stream_read_item> &load_items =
+        g_stream_staging_scratch.load_items;
+    std::vector<uint32_t> &fill_compact =
+        g_stream_staging_scratch.fill_compact; /* compact idx per cache miss */
+    std::vector<uint32_t> &fill_slot =
+        g_stream_staging_scratch.fill_slot; /* reserved slot per cache miss */
+    std::vector<uint8_t> &fill_append = g_stream_staging_scratch.fill_append;
+    std::vector<uint32_t> &direct_compact =
+        g_stream_staging_scratch.direct_compact;
+    load_items.clear();
+    fill_compact.clear();
+    fill_slot.clear();
+    fill_append.clear();
+    direct_compact.clear();
     try {
         load_items.reserve((size_t)compact_count * 3u);
         fill_compact.reserve(compact_count);
@@ -4058,6 +4254,12 @@ static int cuda_stream_selected_cache_begin_compact_load(
                                               down_expert_bytes);
             if (cache_slot >= 0) {
                 cache_hits++;
+                if (trace_on) {
+                    const int peer = (uint32_t)cache_slot >=
+                        expert_cache->local_capacity;
+                    trace_items[i] = { peer ? "peer" : "gpu", peer ? "peer" : "local",
+                                       1, -1, 0, 0 };
+                }
                 expert_cache->slots[(uint32_t)cache_slot].age =
                     ++expert_cache->tick;
                 if (cuda_stream_expert_cache_copy_to_compact(
@@ -4085,6 +4287,15 @@ static int cuda_stream_selected_cache_begin_compact_load(
                     expert_cache->slots[slot].valid ? 0u : 1u;
                 cuda_stream_expert_cache_slot &entry =
                     expert_cache->slots[slot];
+                if (trace_on) {
+                    const int peer = slot >= expert_cache->local_capacity;
+                    trace_items[i] = {
+                        "ssd", peer ? "peer" : "local", 0,
+                        entry.valid ? (int32_t)entry.expert : -1,
+                        entry.valid ? entry.age : 0,
+                        gate_expert_bytes * 2u + down_expert_bytes };
+                }
+                cuda_stream_expert_cache_unindex_slot(expert_cache, slot);
                 entry.valid = 1;
                 entry.model_map = model_map;
                 entry.model_size = model_size;
@@ -4097,6 +4308,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
                 entry.gate_expert_bytes = gate_expert_bytes;
                 entry.down_expert_bytes = down_expert_bytes;
                 entry.age = ++expert_cache->tick;
+                cuda_stream_expert_cache_index_slot(expert_cache, slot);
                 fill_compact.push_back(i);
                 fill_slot.push_back(slot);
                 fill_append.push_back(append);
@@ -4125,6 +4337,11 @@ static int cuda_stream_selected_cache_begin_compact_load(
                             down_expert_bytes);
                     if (l2 >= 0) {
                         host_hits++;
+                        if (trace_on) {
+                            trace_items[i].tier = "host";
+                            trace_items[i].hit = 1;
+                            trace_items[i].bytes_read = 0;
+                        }
                         g_host_expert_cache.slots[(uint32_t)l2].age =
                             ++g_host_expert_cache.tick;
                         gate_item.host_src =
@@ -4183,7 +4400,13 @@ static int cuda_stream_selected_cache_begin_compact_load(
             }
         }
 
-        if (direct) direct_compact.push_back(i);
+        if (direct) {
+            direct_compact.push_back(i);
+            if (trace_on) {
+                trace_items[i] = { "ssd-direct", "compact", 0, -1, 0,
+                                   gate_expert_bytes * 2u + down_expert_bytes };
+            }
+        }
     }
 
     for (uint32_t d = 0; d < direct_compact.size(); d++) {
@@ -4215,6 +4438,9 @@ static int cuda_stream_selected_cache_begin_compact_load(
         stage_t = now;
     }
 
+    const double trace_read_started = trace_on ? cuda_wall_sec() : 0.0;
+    const double trace_classify_us = trace_on ?
+        (trace_read_started - trace_started) * 1000000.0 : 0.0;
     if (!load_items.empty() &&
         !cuda_stream_read_batch(model_map,
                                 model_size,
@@ -4229,7 +4455,9 @@ static int cuda_stream_selected_cache_begin_compact_load(
             expert_cache_disabled = 1;
         }
         if (host_cache) cuda_host_expert_cache_invalidate();
-        std::vector<cuda_stream_read_item> retry_items;
+        std::vector<cuda_stream_read_item> &retry_items =
+            g_stream_staging_scratch.retry_items;
+        retry_items.clear();
         try {
             retry_items.reserve((fill_compact.size() + direct_compact.size()) * 3u);
         } catch (...) {
@@ -4270,6 +4498,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
         }
     }
 
+    if (trace_on) trace_read_ms = (cuda_wall_sec() - trace_read_started) * 1000.0;
     cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.io_ms);
 
     /* Batch landed: account appended slots and mirror each filled slot into
@@ -4294,6 +4523,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
 
     cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.mirror_ms);
 
+    const double trace_upload_started = trace_on ? cuda_wall_sec() : 0.0;
     if (!cuda_ok(cudaMemcpy(g_stream_selected_cache.slot_selected_ptr,
                             slot_ids,
                             (size_t)slot_count * sizeof(slot_ids[0]),
@@ -4301,6 +4531,9 @@ static int cuda_stream_selected_cache_begin_compact_load(
                  "streaming selected slot upload")) {
         cuda_stream_selected_cache_invalidate();
         return strict_failure ? 0 : 1;
+    }
+    if (trace_on) {
+        trace_upload_us = (cuda_wall_sec() - trace_upload_started) * 1000000.0;
     }
     cuda_stream_stage_lap(stage_timing, &stage_t, &g_stream_stage_timing.upload_ms);
 
@@ -4321,6 +4554,44 @@ static int cuda_stream_selected_cache_begin_compact_load(
         (uint64_t)slot_count * sizeof(int32_t);
     g_stream_selected_cache.slot_selected_tensor.owner = 0;
     g_stream_selected_cache.valid = 1;
+
+    if (trace_on) {
+        if (g_expert_trace.have_previous &&
+            layer < g_expert_trace.previous_layer) {
+            g_expert_trace.token_base += g_expert_trace.previous_tokens;
+        }
+        const uint64_t call = g_expert_trace.call++;
+        const double stage_us = (cuda_wall_sec() - trace_started) * 1000000.0;
+        for (uint32_t token = 0; token < trace_n_tokens; token++) {
+            for (uint32_t selected = 0; selected < trace_n_selected; selected++) {
+                if (g_expert_trace.rows >= g_expert_trace.max_rows) break;
+                const uint32_t router_slot = token * trace_n_selected + selected;
+                const int32_t compact_slot = slot_ids[router_slot];
+                if (compact_slot < 0 || (uint32_t)compact_slot >= compact_count) continue;
+                const cuda_expert_trace_item &item =
+                    trace_items[(uint32_t)compact_slot];
+                fprintf(g_expert_trace.file,
+                        "%llu,%llu,%u,%u,%d,%s,%s,%d,%d,%llu,%llu,%.0f,%.0f,%.0f,%.0f,%llu,%u,%u\n",
+                        (unsigned long long)call,
+                        (unsigned long long)(g_expert_trace.token_base + token),
+                        layer, selected, trace_ids[router_slot], item.tier,
+                        item.owner, item.hit, item.victim,
+                        (unsigned long long)item.victim_age,
+                        (unsigned long long)(trace_accounted[(uint32_t)compact_slot]
+                            ? 0 : item.bytes_read),
+                        trace_classify_us, trace_read_ms * 1000.0,
+                        trace_upload_us, stage_us,
+                        (unsigned long long)model_size,
+                        expert_cache && expert_cache->valid ? expert_cache->capacity : 0,
+                        expert_cache && expert_cache->valid ? expert_cache->local_capacity : 0);
+                trace_accounted[(uint32_t)compact_slot] = 1;
+                g_expert_trace.rows++;
+            }
+        }
+        g_expert_trace.previous_layer = layer;
+        g_expert_trace.previous_tokens = trace_n_tokens;
+        g_expert_trace.have_previous = 1;
+    }
 
     if (cuda_stream_expert_cache_verbose()) {
         cuda_model_load_progress_finish();
@@ -4358,10 +4629,18 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
     const uint64_t gate_expert_bytes = table->gate_expert_bytes;
     const uint64_t down_expert_bytes = table->down_expert_bytes;
 
-    std::vector<int32_t> expert_to_slot(n_total_expert, -1);
-    std::vector<int32_t> compact_ids;
-    std::vector<int32_t> slot_ids(n_selected);
-    compact_ids.reserve(n_selected);
+    std::vector<int32_t> &expert_to_slot =
+        g_stream_staging_scratch.expert_to_slot;
+    std::vector<int32_t> &compact_ids = g_stream_staging_scratch.compact_ids;
+    std::vector<int32_t> &slot_ids = g_stream_staging_scratch.slot_ids;
+    try {
+        expert_to_slot.assign(n_total_expert, -1);
+        compact_ids.clear();
+        slot_ids.resize(n_selected);
+        compact_ids.reserve(n_selected);
+    } catch (...) {
+        return 0;
+    }
     for (uint32_t i = 0; i < n_selected; i++) {
         const int32_t expert_i = selected_ids[i];
         if (expert_i < 0 || (uint32_t)expert_i >= n_total_expert) {
@@ -4398,7 +4677,10 @@ extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
             gate_expert_bytes,
             down_expert_bytes,
             0,
-            1);
+            1,
+            selected_ids,
+            1,
+            n_selected);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -4425,11 +4707,19 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
     const uint64_t gate_expert_bytes = table->gate_expert_bytes;
     const uint64_t down_expert_bytes = table->down_expert_bytes;
 
-    std::vector<int32_t> expert_to_slot(n_total_expert, -1);
-    std::vector<int32_t> compact_ids;
+    std::vector<int32_t> &expert_to_slot =
+        g_stream_staging_scratch.expert_to_slot;
+    std::vector<int32_t> &compact_ids = g_stream_staging_scratch.compact_ids;
+    std::vector<int32_t> &slot_ids = g_stream_staging_scratch.slot_ids;
     const uint32_t slot_count = n_tokens * n_selected;
-    std::vector<int32_t> slot_ids(slot_count);
-    compact_ids.reserve(slot_count < n_total_expert ? slot_count : n_total_expert);
+    try {
+        expert_to_slot.assign(n_total_expert, -1);
+        compact_ids.clear();
+        slot_ids.resize(slot_count);
+        compact_ids.reserve(slot_count < n_total_expert ? slot_count : n_total_expert);
+    } catch (...) {
+        return 0;
+    }
 
     for (uint32_t i = 0; i < slot_count; i++) {
         const int32_t expert_i = selected_ids[i];
@@ -4468,7 +4758,10 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             gate_expert_bytes,
             down_expert_bytes,
             1,
-            0);
+            0,
+            selected_ids,
+            n_tokens,
+            n_selected);
 }
 
 extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
@@ -13494,6 +13787,11 @@ static int glm_cuda_stream_selected_cache_matches(
 static int glm_cuda_stream_staged_ids_match(
         const void *model_map, uint32_t layer, const int32_t *ids,
         uint32_t count);
+static int glm_cuda_stream_staged_tensor_status(
+        const void *model_map, uint32_t layer,
+        const ds4_gpu_tensor *selected, uint32_t count);
+static const int32_t *glm_cuda_stream_selected_readback(
+        const ds4_gpu_tensor *selected, uint32_t count);
 static void glm_cuda_stream_staged_ids_record(
         const void *model_map, uint32_t layer, const int32_t *ids,
         uint32_t count);
@@ -13598,34 +13896,23 @@ static int routed_moe_launch(
         g_stream_selected_cache.slot_selected_tensor.bytes >=
             required_slot_count * sizeof(int32_t);
     if (g_ssd_streaming_mode && !force_resident && cuda_glm_experimental_mode()) {
-        /* GLM: the compact cache does not remember WHICH routed ids filled
-         * its slots, and GLM prefill has no host-side staging call before
-         * this launcher — verify the staged ids against the actual routing
-         * and (re)stage on demand, exactly like glm_routed_moe_launch in
-         * ds4_cuda_glm.inc. A stale hit (same layer/params, different
-         * routing) would silently compute with the wrong experts. */
-        std::vector<int32_t> host_ids;
-        try {
-            host_ids.resize((size_t)required_slot_count);
-        } catch (...) {
-            DS4_MOE_DBG("GLM staging: host id buffer alloc failed");
+        /* Decode already staged and recorded the authoritative host IDs.
+         * Prefill has no early host staging, so only that cache-miss path
+         * performs a selected-ID readback here. The diagnostic env gate
+         * restores a decode GPU-vs-host cross-check. */
+        const int staged_status = glm_cuda_stream_staged_tensor_status(
+                model_map, layer_index, selected,
+                (uint32_t)required_slot_count);
+        if (staged_status < 0) {
+            DS4_MOE_DBG("GLM staging: selected-ID diagnostic mismatch");
             return 0;
         }
-        if (!ds4_gpu_tensor_read(selected,
-                                 0,
-                                 host_ids.data(),
-                                 required_slot_count * sizeof(int32_t))) {
-            DS4_MOE_DBG("GLM staging: selected readback failed");
-            return 0;
-        }
-        const int cache_ready =
-            use_stream_selected_cache &&
-            glm_cuda_stream_staged_ids_match(model_map,
-                                             layer_index,
-                                             host_ids.data(),
-                                             (uint32_t)required_slot_count);
+        const int cache_ready = use_stream_selected_cache && staged_status == 1;
         if (!cache_ready) {
-            if (!glm_cuda_stream_stage_selected(model_map,
+            const int32_t *host_ids = glm_cuda_stream_selected_readback(
+                    selected, (uint32_t)required_slot_count);
+            if (!host_ids ||
+                !glm_cuda_stream_stage_selected(model_map,
                                                 model_size,
                                                 layer_index,
                                                 n_total_expert,
@@ -13634,7 +13921,7 @@ static int routed_moe_launch(
                                                 down_offset,
                                                 gate_expert_bytes,
                                                 down_expert_bytes,
-                                                host_ids.data(),
+                                                host_ids,
                                                 (uint32_t)required_slot_count,
                                                 n_tokens) ||
                 !glm_cuda_stream_selected_cache_matches(model_map,
@@ -13653,7 +13940,7 @@ static int routed_moe_launch(
             }
             glm_cuda_stream_staged_ids_record(model_map,
                                               layer_index,
-                                              host_ids.data(),
+                                              host_ids,
                                               (uint32_t)required_slot_count);
         }
         use_stream_selected_cache = 1;

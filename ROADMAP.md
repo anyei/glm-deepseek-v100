@@ -128,15 +128,29 @@ can't just be committed blind on numerically-validated shipping code.
 The two efficiency findings below are perf, not cleanup — they belong to §2's
 hot-path work but were surfaced here:
 
-- [ ] **Per-layer allocator churn in the staging path** — `begin_selected_load`
-  / `begin_compact_load` / `glm_cuda_stream_stage_selected` allocate ~8–11
-  `std::vector`s per routed layer per token (~700–1000 mallocs/token on a cache
-  hit) plus an O(n_total_expert) memset. Hoist to reused file-scope buffers
-  (`.clear()`, retain capacity). Could move decode t/s.
-- [ ] **Forced D2H sync every decode layer even on cache hit** —
-  `glm_routed_moe_launch` does a blocking `ds4_gpu_tensor_read(selected)` per
-  layer just to re-validate staging (~90 sync points/token). Thread the
-  host-side router ids (already available in `ds4.c`) through instead.
+- [x] **Per-layer allocator churn in the staging path** — completed 2026-07-10.
+  `begin_selected_load` / `begin_compact_load` /
+  `glm_cuda_stream_stage_selected` now share process/session scratch vectors,
+  clear logical lengths, and retain capacity. A 9,288-row before/after expert
+  trace matched cache classification and bytes exactly. The
+  O(n_total_expert) initialization remains for a later generation-tag change
+  only if profiling shows it matters.
+- [x] **Peer cache masked local-cache growth** — fixed 2026-07-10. Cache growth
+  compared a requested local target against combined local+peer capacity, so a
+  tiny seed allocation (about 3 slots at context 256) appeared to satisfy the
+  701-slot local target once 3,944 peer slots existed. Compare against
+  `local_capacity` instead. Three 96-token runs improved median steady decode
+  3.77 -> 4.25 t/s (+12.7%); the trace and architecture CSV preserve the old
+  geometry/result. The benchmark parser now prefers an explicit runtime
+  allocation line rather than inferring slots from the requested plan.
+- [x] **Forced D2H sync every decode layer even on cache hit** — implemented
+  2026-07-10. GLM's early selected-expert staging already reads and records the
+  authoritative host IDs; both routed-MoE launchers now trust that record and
+  avoid the second blocking `ds4_gpu_tensor_read(selected)`. Prefill/cache-miss
+  paths retain the required readback, and
+  `DS4_CUDA_STREAM_SELECTED_ID_CROSSCHECK=1` restores a diagnostic GPU-vs-host
+  comparison. CUDA and DeepSeek regression smokes pass; a GLM runtime fixture
+  remains blocked because the local GLM model was removed.
 
 ## 4. Standing rule for every change above
 

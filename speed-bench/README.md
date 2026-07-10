@@ -59,7 +59,10 @@ hash as `DS4_MODEL_SHA256`; hashing is opt-in because the tested GGUFs are
 81–245 GiB. Sensitive environment values containing `KEY`, `TOKEN`, `SECRET`,
 or `PASSWORD` are redacted from metadata. Each measured process emits normal
 `ds4-bench` CSV rows. The harness summarizes their median and range
-automatically; compare two completed run directories with:
+automatically. It also reports live-capped local/peer expert slot counts, peak
+VRAM by device, and backing-device
+read bytes (new runs record the model filesystem's major/minor device for that
+calculation). Compare two completed run directories with:
 
 ```sh
 python3 speed-bench/v100_compare.py \
@@ -68,13 +71,53 @@ python3 speed-bench/v100_compare.py \
 ```
 
 Run `speed-bench/v100_bench.sh` without arguments for every override. Before a
-real run, the harness requires at least 80% CPU idle, no swap-in/out during its
-one-second sample, and idle GPUs using at most 512 MiB each. Stop competing
-builds and model servers rather than contaminating a canonical result;
+real run, the harness requires at least 80% CPU idle, negligible swap I/O, and
+idle GPUs using at most 512 MiB each. It repeats that preflight before every
+process. It rejects more than 16 MiB during a one-second preflight or 256 MiB
+combined over a complete process (`DS4_MAX_SWAP_IO_MIB_PER_SEC` and
+`DS4_MAX_SWAP_IO_MIB` override the thresholds). This tolerates low-rate touches
+of old dormant pages without admitting sustained memory pressure.
+Stop competing builds and model servers rather than
+contaminating a canonical result;
 `DS4_ALLOW_BUSY=1` is available only for explicitly non-canonical smoke tests.
 Set `DS4_DRY_RUN=1` to validate and print container commands without occupying
 the GPUs. Performance claims should use at least 96 generated tokens and three
 measured runs; shorter runs are smoke tests only.
+
+## Expert-access traces
+
+CUDA expert staging can emit an opt-in compact CSV for cache-policy replay:
+
+```sh
+DS4_CUDA_EXPERT_TRACE=/tmp/deepseek-experts.csv \
+DS4_CUDA_EXPERT_TRACE_MODEL_ID=31598c67... \
+DS4_CUDA_EXPERT_TRACE_MAX_ROWS=1000000 \
+  ./ds4 ... --cuda --ssd-streaming
+```
+
+The trace records router slots, logical token epoch, layer/expert, cache tier and
+owner, hit/miss, victim and age, uniquely accounted bytes read, batched I/O,
+classify/peer-copy, slot-upload and total stage timing, and cache geometry.
+Timing fields are batch-level and repeat
+for rows belonging to the same staging call; sum `bytes_read`, but do not sum
+repeated timing fields. Tracing is disabled by default. The row cap bounds both
+file size and diagnostic overhead; raw traces belong outside git.
+
+Replay a trace with:
+
+```sh
+python3 speed-bench/expert-cache-sim.py /tmp/deepseek-experts.csv
+```
+
+The simulator deduplicates router slots exactly as runtime compaction does and
+refuses to trust alternatives unless `exact-lru` reproduces observed unique
+hits, misses, and bytes. `--capacity` supports capacity experiments;
+`--decode-token-start` enables decode/prefill accounting and protected regions.
+Policies include segmented LRU, TinyLFU admission, per-layer quotas,
+owner-balanced placement, decode-protected/prefill-ephemeral capacity, and
+optional top-K replication. Reuse-distance percentiles and optional per-layer
+reports are included. The final line states whether the best alternative passes
+the 20% runtime-policy gate.
 
 ## Disk read throughput (`io_probe.c`)
 

@@ -459,11 +459,12 @@ static uint64_t glm_cuda_row_bytes_for_type(uint32_t type, uint32_t in_dim) {
  * ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor (called from
  * the GLM graph in ds4.c before each routed MoE). Prefill has no host-side
  * staging call on CUDA (Metal used its own address table), so the launcher
- * stages on demand. Because g_stream_selected_cache does not remember WHICH
- * routed ids produced its compact slots, the launcher keeps a host copy of
- * the last staged ids and re-stages whenever they differ — a stale hit
- * (same layer, different routing) would otherwise compute with the wrong
- * experts.
+ * stages on demand. Decode's early staging records the exact host IDs that
+ * produced the compact slots; the launcher trusts that record and avoids a
+ * second blocking D2H read. DS4_CUDA_STREAM_SELECTED_ID_CROSSCHECK=1 restores
+ * a diagnostic GPU-vs-host comparison. Prefill and any missing/stale host
+ * record still read back IDs before staging, so a stale compact table cannot
+ * be consumed silently.
  * ========================================================================= */
 
 static std::vector<int32_t> g_glm_stream_staged_ids;
@@ -503,6 +504,53 @@ static int glm_cuda_stream_staged_ids_match(
            memcmp(g_glm_stream_staged_ids.data(),
                   ids,
                   (size_t)count * sizeof(int32_t)) == 0;
+}
+
+static std::vector<int32_t> g_glm_stream_readback_ids;
+
+static const int32_t *glm_cuda_stream_selected_readback(
+        const ds4_gpu_tensor *selected,
+        uint32_t              count) {
+    if (!selected || count == 0 ||
+        selected->bytes < (uint64_t)count * sizeof(int32_t)) return NULL;
+    try {
+        g_glm_stream_readback_ids.resize(count);
+    } catch (...) {
+        return NULL;
+    }
+    if (!ds4_gpu_tensor_read(selected, 0, g_glm_stream_readback_ids.data(),
+                             (uint64_t)count * sizeof(int32_t))) return NULL;
+    return g_glm_stream_readback_ids.data();
+}
+
+/* 1: host-recorded staging is authoritative; 0: no matching host record;
+ * -1: diagnostic GPU cross-check failed. The normal decode path performs no
+ * D2H read here because begin_selected_load_tensor already read and recorded
+ * the exact IDs used to build the compact slot table. */
+static int glm_cuda_stream_staged_tensor_status(
+        const void           *model_map,
+        uint32_t              layer,
+        const ds4_gpu_tensor *selected,
+        uint32_t              count) {
+    if (!g_glm_stream_staged_valid ||
+        g_glm_stream_staged_model_map != model_map ||
+        g_glm_stream_staged_layer != layer ||
+        g_glm_stream_staged_ids.size() != (size_t)count) return 0;
+    static int crosscheck = -1;
+    if (crosscheck < 0) {
+        const char *env = getenv("DS4_CUDA_STREAM_SELECTED_ID_CROSSCHECK");
+        crosscheck = env && env[0] && strcmp(env, "0") != 0;
+    }
+    if (!crosscheck) return 1;
+    const int32_t *gpu_ids = glm_cuda_stream_selected_readback(selected, count);
+    if (!gpu_ids || !glm_cuda_stream_staged_ids_match(model_map, layer,
+                                                       gpu_ids, count)) {
+        fprintf(stderr,
+                "ds4: CUDA GLM staged selected-ID diagnostic mismatch at layer %u\n",
+                layer);
+        return -1;
+    }
+    return 1;
 }
 
 /* Mirror of routed_moe_launch's use_stream_selected_cache condition. */
@@ -556,11 +604,13 @@ static int glm_cuda_stream_stage_selected(
         uint32_t       slot_count,
         uint32_t       n_tokens) {
     if (!ids || slot_count == 0 || n_total_expert == 0) { DS4_GLM_DBG_RET0(); return 0; }
-    std::vector<int32_t> expert_to_slot;
-    std::vector<int32_t> compact_ids;
-    std::vector<int32_t> slot_ids;
+    std::vector<int32_t> &expert_to_slot =
+        g_stream_staging_scratch.expert_to_slot;
+    std::vector<int32_t> &compact_ids = g_stream_staging_scratch.compact_ids;
+    std::vector<int32_t> &slot_ids = g_stream_staging_scratch.slot_ids;
     try {
         expert_to_slot.assign(n_total_expert, -1);
+        compact_ids.clear();
         slot_ids.resize(slot_count);
         compact_ids.reserve(slot_count < n_total_expert ? slot_count
                                                         : n_total_expert);
@@ -604,7 +654,10 @@ static int glm_cuda_stream_stage_selected(
             gate_expert_bytes,
             down_expert_bytes,
             /*strict_failure=*/1,
-            /*allow_global_cache=*/n_tokens == 1u);
+            /*allow_global_cache=*/n_tokens == 1u,
+            ids,
+            n_tokens,
+            slot_count / n_tokens);
 }
 
 static int glm_routed_moe_launch(
@@ -697,19 +750,11 @@ static int glm_routed_moe_launch(
          * guard. */
         if (gate_expert_bytes != up_expert_bytes) { DS4_GLM_DBG_RET0(); return 0; }
         const uint64_t required_slot_count = (uint64_t)n_tokens * n_expert;
-        std::vector<int32_t> host_ids;
-        try {
-            host_ids.resize((size_t)required_slot_count);
-        } catch (...) {
-            { DS4_GLM_DBG_RET0(); return 0; }
-        }
-        if (!ds4_gpu_tensor_read(selected,
-                                 0,
-                                 host_ids.data(),
-                                 required_slot_count * sizeof(int32_t))) {
-            { DS4_GLM_DBG_RET0(); return 0; }
-        }
-        const int cache_ready =
+        const int staged_status = glm_cuda_stream_staged_tensor_status(
+                model_map, layer_index, selected,
+                (uint32_t)required_slot_count);
+        if (staged_status < 0) { DS4_GLM_DBG_RET0(); return 0; }
+        const int cache_ready = staged_status == 1 &&
             glm_cuda_stream_selected_cache_matches(model_map,
                                                    layer_index,
                                                    n_total_expert,
@@ -718,13 +763,12 @@ static int glm_routed_moe_launch(
                                                    up_offset,
                                                    down_offset,
                                                    gate_expert_bytes,
-                                                   down_expert_bytes) &&
-            glm_cuda_stream_staged_ids_match(model_map,
-                                             layer_index,
-                                             host_ids.data(),
-                                             (uint32_t)required_slot_count);
+                                                   down_expert_bytes);
         if (!cache_ready) {
-            if (!glm_cuda_stream_stage_selected(model_map,
+            const int32_t *host_ids = glm_cuda_stream_selected_readback(
+                    selected, (uint32_t)required_slot_count);
+            if (!host_ids ||
+                !glm_cuda_stream_stage_selected(model_map,
                                                 model_size,
                                                 layer_index,
                                                 n_total_expert,
@@ -733,7 +777,7 @@ static int glm_routed_moe_launch(
                                                 down_offset,
                                                 gate_expert_bytes,
                                                 down_expert_bytes,
-                                                host_ids.data(),
+                                                host_ids,
                                                 (uint32_t)required_slot_count,
                                                 n_tokens) ||
                 !glm_cuda_stream_selected_cache_matches(model_map,
@@ -752,7 +796,7 @@ static int glm_routed_moe_launch(
             }
             glm_cuda_stream_staged_ids_record(model_map,
                                               layer_index,
-                                              host_ids.data(),
+                                              host_ids,
                                               (uint32_t)required_slot_count);
         }
         gate_w = g_stream_selected_cache.gate_ptr;

@@ -25,6 +25,8 @@ Common overrides:
   DS4_READ_THREADS=8
   DS4_MIN_CPU_IDLE_PCT=80       refuse a loaded benchmark host
   DS4_MAX_IDLE_GPU_MIB=512      refuse GPUs already holding a workload
+  DS4_MAX_SWAP_IO_MIB=256       maximum combined swap I/O per process
+  DS4_MAX_SWAP_IO_MIB_PER_SEC=16 maximum during each one-second preflight
   DS4_ALLOW_BUSY=1              override the idle-host preflight
   DS4_HASH_MODEL=1              compute the large GGUF SHA-256 once
   DS4_MODEL_SHA256=<known-hash> record a known hash without rereading it
@@ -81,6 +83,9 @@ dry_run=${DS4_DRY_RUN:-0}
 hash_model=${DS4_HASH_MODEL:-0}
 min_cpu_idle=${DS4_MIN_CPU_IDLE_PCT:-80}
 max_idle_gpu_mib=${DS4_MAX_IDLE_GPU_MIB:-512}
+max_swap_io_mib=${DS4_MAX_SWAP_IO_MIB:-256}
+max_swap_io_mib_per_sec=${DS4_MAX_SWAP_IO_MIB_PER_SEC:-16}
+page_size=$(getconf PAGESIZE)
 allow_busy=${DS4_ALLOW_BUSY:-0}
 
 for pair in "DS4_CTX_START:$ctx_start" "DS4_CTX_MAX:$ctx_max" \
@@ -88,7 +93,9 @@ for pair in "DS4_CTX_START:$ctx_start" "DS4_CTX_MAX:$ctx_max" \
             "DS4_RUNS:$runs" "DS4_WARMUPS:$warmups" \
             "DS4_TIMEOUT_SEC:$timeout_sec" "DS4_READ_THREADS:$read_threads" \
             "DS4_MIN_CPU_IDLE_PCT:$min_cpu_idle" \
-            "DS4_MAX_IDLE_GPU_MIB:$max_idle_gpu_mib"; do
+            "DS4_MAX_IDLE_GPU_MIB:$max_idle_gpu_mib" \
+            "DS4_MAX_SWAP_IO_MIB:$max_swap_io_mib" \
+            "DS4_MAX_SWAP_IO_MIB_PER_SEC:$max_swap_io_mib_per_sec"; do
     key=${pair%%:*}; value=${pair#*:}
     [[ "$value" =~ ^[0-9]+$ ]] || die "$key must be a non-negative integer"
 done
@@ -100,6 +107,7 @@ preflight_idle_host() {
     [[ "$dry_run" != 0 || "$allow_busy" != 0 ]] && return 0
     local _ u1 n1 s1 i1 w1 q1 sq1 st1 u2 n2 s2 i2 w2 q2 sq2 st2
     local pin1 pout1 pin2 pout2 total1 total2 idle_delta total_delta idle_pct
+    local swap_pages swap_bytes max_swap_bytes
     read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
     pin1=$(awk '$1=="pswpin"{print $2}' /proc/vmstat)
     pout1=$(awk '$1=="pswpout"{print $2}' /proc/vmstat)
@@ -112,6 +120,9 @@ preflight_idle_host() {
     idle_delta=$((i2-i1))
     total_delta=$((total2-total1))
     idle_pct=$((total_delta > 0 ? 100 * idle_delta / total_delta : 0))
+    swap_pages=$((pin2-pin1 + pout2-pout1))
+    swap_bytes=$((swap_pages * page_size))
+    max_swap_bytes=$((max_swap_io_mib_per_sec * 1048576))
 
     local gpu_busy=0 gpu_state
     gpu_state=$(nvidia-smi --query-gpu=index,memory.used,utilization.gpu \
@@ -121,11 +132,11 @@ preflight_idle_host() {
         if (( mem > max_idle_gpu_mib || util > 5 )); then gpu_busy=1; fi
     done <<<"$gpu_state"
 
-    if (( idle_pct < min_cpu_idle || pin2 != pin1 || pout2 != pout1 || gpu_busy )); then
+    if (( idle_pct < min_cpu_idle || swap_bytes > max_swap_bytes || gpu_busy )); then
         printf 'v100_bench: host is not idle enough for a canonical run:\n' >&2
         printf '  cpu_idle=%s%% (required >= %s%%)\n' "$idle_pct" "$min_cpu_idle" >&2
-        printf '  swap_delta_in=%s swap_delta_out=%s (required 0/0)\n' \
-            "$((pin2-pin1))" "$((pout2-pout1))" >&2
+        printf '  swap_delta_in=%s swap_delta_out=%s pages (limit %s MiB combined)\n' \
+            "$((pin2-pin1))" "$((pout2-pout1))" "$max_swap_io_mib_per_sec" >&2
         while IFS= read -r line; do printf '  gpu %s\n' "$line" >&2; done <<<"$gpu_state"
         die "stop competing work or set DS4_ALLOW_BUSY=1 for a non-canonical smoke test"
     fi
@@ -173,12 +184,16 @@ write_metadata() {
         printf 'binary_dir=%s\nmodel=%s\nprompt_rel=%s\n' "$binary_dir" "$model" "$prompt_rel"
         printf 'model_bytes=%s\n' "$(stat -c %s "$model")"
         printf 'model_mtime=%s\n' "$(stat -c %y "$model")"
+        printf 'model_device=%s\n' "$(findmnt -no SOURCE --target "$model" 2>/dev/null || echo unknown)"
+        printf 'model_device_maj_min=%s\n' "$(findmnt -no MAJ:MIN --target "$model" 2>/dev/null || echo unknown)"
         printf 'model_sha256=%s\n' "$model_sha256"
         printf 'image=%s\nctx_start=%s\nctx_max=%s\nstep_incr=%s\n' "$image" "$ctx_start" "$ctx_max" "$step_incr"
         printf 'gen_tokens=%s\ncache=%s\nruns=%s\nwarmups=%s\n' "$gen_tokens" "$cache" "$runs" "$warmups"
         printf 'read_threads=%s\nwarm_weights=%s\ntimeout_sec=%s\n' "$read_threads" "$warm_weights" "$timeout_sec"
-        printf 'min_cpu_idle_pct=%s\nmax_idle_gpu_mib=%s\nallow_busy=%s\n' \
-            "$min_cpu_idle" "$max_idle_gpu_mib" "$allow_busy"
+        printf 'min_cpu_idle_pct=%s\nmax_idle_gpu_mib=%s\nmax_swap_io_mib=%s\n' \
+            "$min_cpu_idle" "$max_idle_gpu_mib" "$max_swap_io_mib"
+        printf 'max_swap_io_mib_per_sec=%s\nallow_busy=%s\n' \
+            "$max_swap_io_mib_per_sec" "$allow_busy"
         printf 'git_sha=%s\n' "$(git -C "$binary_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
         printf 'git_status=%q\n' "$(git -C "$binary_dir" status --short 2>/dev/null || true)"
         printf 'ds4_sha256=%s\n' "$(sha256sum "$binary_dir/ds4" | awk '{print $1}')"
@@ -200,6 +215,7 @@ monitor_pid=
 start_monitor() {
     local dir=$1
     cp /proc/diskstats "$dir/diskstats.before"
+    cp /proc/vmstat "$dir/vmstat.before"
     (
         printf 'timestamp,index,memory_used_MiB,util_gpu_pct,util_mem_pct,pstate,sm_clock_MHz,mem_clock_MHz,power_W,temp_C\n'
         while :; do
@@ -218,7 +234,26 @@ stop_monitor() {
         monitor_pid=
     fi
     cp /proc/diskstats "$dir/diskstats.after"
+    cp /proc/vmstat "$dir/vmstat.after"
     free -h >"$dir/memory.after"
+
+    local pin_before pin_after pout_before pout_after
+    pin_before=$(awk '$1=="pswpin"{print $2}' "$dir/vmstat.before")
+    pin_after=$(awk '$1=="pswpin"{print $2}' "$dir/vmstat.after")
+    pout_before=$(awk '$1=="pswpout"{print $2}' "$dir/vmstat.before")
+    pout_after=$(awk '$1=="pswpout"{print $2}' "$dir/vmstat.after")
+    {
+        printf 'pswpin_delta=%s\n' "$((pin_after-pin_before))"
+        printf 'pswpout_delta=%s\n' "$((pout_after-pout_before))"
+    } >"$dir/swap_delta.txt"
+    local swap_pages=$((pin_after-pin_before + pout_after-pout_before))
+    local swap_bytes=$((swap_pages * page_size))
+    if [[ "$allow_busy" == 0 ]] &&
+       (( swap_bytes > max_swap_io_mib * 1048576 )); then
+        printf 'v100_bench: swap I/O exceeded %s MiB during benchmark; run is non-canonical (%s)\n' \
+            "$max_swap_io_mib" "$(tr '\n' ' ' <"$dir/swap_delta.txt")" >&2
+        return 1
+    fi
 }
 active_containers=()
 cleanup() {
@@ -253,7 +288,9 @@ run_single_process() {
     set -e
     docker rm -f "$name" >/dev/null 2>&1 || true
     active_containers=()
-    stop_monitor "$dir"
+    local monitor_rc=0
+    stop_monitor "$dir" || monitor_rc=$?
+    if (( rc == 0 && monitor_rc != 0 )); then rc=$monitor_rc; fi
     printf '%s\n' "$rc" >"$dir/exit_code"
     return "$rc"
 }
@@ -329,7 +366,9 @@ run_distributed() {
     docker logs "$worker" >"$dir/worker.log" 2>&1 || true
     docker rm -f "$worker" "$coord" >/dev/null 2>&1 || true
     active_containers=()
-    stop_monitor "$dir"
+    local monitor_rc=0
+    stop_monitor "$dir" || monitor_rc=$?
+    if (( rc == 0 && monitor_rc != 0 )); then rc=$monitor_rc; fi
     printf '%s\n' "$rc" >"$dir/exit_code"
     return "$rc"
 }
@@ -337,6 +376,9 @@ run_distributed() {
 run_one() {
     local kind=$1 index=$2
     local dir="$out/$kind-$index"
+    # A sweep can run for hours; another workload may start after the initial
+    # preflight. Recheck before every process rather than trusting startup state.
+    preflight_idle_host
     mkdir -p "$dir"
     printf 'v100_bench: %s %s/%s\n' "$kind" "$index" "$([[ "$kind" == warmup ]] && echo "$warmups" || echo "$runs")"
     if [[ "$profile" == distributed ]]; then

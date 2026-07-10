@@ -167,6 +167,39 @@ Running it (on by default since the release gate passed;
 - Distributed: GPU IPC / distributed sessions still decline GLM and
   fall back to TCP or single-GPU.
 
+### Two-V100 architecture benchmark (2026-07-10)
+
+The reproducible Phase 1 benchmark is tracked in
+`speed-bench/v100_architecture.csv` (DeepSeek V4 Flash, context 256, 96 generated
+tokens, 8 GiB requested local cache). Single-GPU decode reached median 2.37
+steady t/s; two of its samples agreed at 2.37–2.40 and one storage-latency
+outlier fell to 0.94. The initial 26 GiB passive-peer result was 3.77 t/s, but a
+later expert trace exposed that its local grow check compared the local target
+to combined local+peer capacity: only about 3 local slots had survived beside
+3,944 peer slots, while the benchmark parser misleadingly reported the planned
+701. Comparing against `local_capacity` restores the intended 701+3,944 slots.
+Three corrected runs produced 4.10–4.26 steady t/s with a **4.25 median: +12.7%
+over the buggy peer result and +79% over single GPU**. Median backing reads were
+209.12 GiB. Prefill fell 4.6% and first-token latency rose 13%, an accepted
+interactive-decode tradeoff. The CSV preserves both `peer-grow-bug` and
+`peer-fixed` rows so the superseded number is not silently rewritten.
+
+A corrected context-256/96-token trace contained 181,632 rows. The offline
+simulator exactly reproduced 45,472 hits, 16,466 misses, and 116,544,503,808
+expert bytes. Segmented LRU, TinyLFU, decode protection, owner balancing and
+replication saved 0%; equal per-layer quotas regressed bytes 1.38%. Useful
+policies saw no eviction, and prefill did not populate the global cache. Cache
+policy therefore fails its 20% implementation gate on this workload.
+
+The whole-layer distributed profile completed a full 96-token screening run at
+only 0.14 steady t/s and about 980 GiB of combined backing-device reads. That is
+roughly 27x slower than passive peer; it was stopped before three repetitions
+because it cannot approach the plan's +10% acceptance gate. This is deliberately
+recorded as a screening/no-go result, not a canonical three-sample claim.
+Passive peer caching is therefore the production interactive-decode default on
+this host. The GLM architecture A/B could not be rerun after its local model was
+removed to remediate storage.
+
 ### Docker build from the local tree (`Dockerfile`)
 
 The image builds ds4 from this working tree (not a fresh upstream

@@ -14,6 +14,18 @@ ROW_RE = re.compile(
     r"^(\d+),(\d+),([0-9.eE+-]+),(\d+),([0-9.eE+-]+),"
     r"([0-9.eE+-]+),(\d+),([0-9.eE+-]+),(\d+)$"
 )
+CACHE_RE = re.compile(
+    r"dynamic cache \((\d+) experts, ([0-9.]+) MiB each\)"
+)
+CACHE_CAP_RE = re.compile(
+    r"streaming expert cache capped from \d+ to (\d+) experts"
+)
+CACHE_ALLOC_RE = re.compile(
+    r"expert cache allocated: local=(\d+) peer=(\d+) total=(\d+) slots"
+)
+PEER_CACHE_RE = re.compile(
+    r"peer expert cache: \+(\d+) experts / ([0-9.]+) GiB on device (\d+)"
+)
 
 
 @dataclass(frozen=True)
@@ -31,12 +43,22 @@ class Row:
 
 
 @dataclass
+class RunResources:
+    local_slots: int | None
+    peer_slots: int | None
+    peer_gib: float | None
+    gpu_peak_mib: dict[int, int]
+    disk_read_bytes: int | None
+
+
+@dataclass
 class Result:
     path: Path
     label: str
     profile: str
     sha: str
     rows: list[Row]
+    resources: list[RunResources]
 
 
 def metadata(path: Path) -> dict[str, str]:
@@ -52,11 +74,65 @@ def metadata(path: Path) -> dict[str, str]:
     return out
 
 
+def disk_sectors(path: Path, maj_min: str) -> int | None:
+    if not path.exists() or ":" not in maj_min:
+        return None
+    major, minor = (int(part) for part in maj_min.split(":", 1))
+    for line in path.read_text(errors="replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and int(fields[0]) == major and int(fields[1]) == minor:
+            return int(fields[5])
+    return None
+
+
+def run_resources(run_dir: Path, log_text: str, meta: dict[str, str]) -> RunResources:
+    configured = CACHE_RE.search(log_text)
+    capped = CACHE_CAP_RE.findall(log_text)
+    allocated = CACHE_ALLOC_RE.findall(log_text)
+    local_slots = int(allocated[-1][0]) if allocated else (
+        int(capped[-1]) if capped else (int(configured.group(1)) if configured else None)
+    )
+    peer = PEER_CACHE_RE.search(log_text)
+    allocated_peer = int(allocated[-1][1]) if allocated else None
+
+    peaks: dict[int, int] = {}
+    gpu_csv = run_dir / "gpu.csv"
+    if gpu_csv.exists():
+        import csv
+        with gpu_csv.open(newline="", errors="replace") as file:
+            for row in csv.DictReader(file):
+                try:
+                    gpu = int(row["index"].strip())
+                    used = int(row["memory_used_MiB"].strip())
+                except (KeyError, TypeError, ValueError):
+                    continue
+                peaks[gpu] = max(peaks.get(gpu, 0), used)
+
+    maj_min = meta.get("model_device_maj_min", "")
+    before = disk_sectors(run_dir / "diskstats.before", maj_min)
+    after = disk_sectors(run_dir / "diskstats.after", maj_min)
+    disk_bytes = None
+    if before is not None and after is not None and after >= before:
+        # Linux /proc/diskstats sectors are always 512 bytes.
+        disk_bytes = (after - before) * 512
+
+    return RunResources(
+        local_slots=local_slots,
+        peer_slots=allocated_peer if allocated_peer is not None else (
+            int(peer.group(1)) if peer else None
+        ),
+        peer_gib=float(peer.group(2)) if peer else None,
+        gpu_peak_mib=peaks,
+        disk_read_bytes=disk_bytes,
+    )
+
+
 def load(path: Path) -> Result:
     if not path.is_dir():
         raise ValueError(f"not a run directory: {path}")
     meta = metadata(path)
     rows: list[Row] = []
+    resources: list[RunResources] = []
     run_dirs = sorted(
         (p for p in path.glob("run-*") if p.is_dir()),
         key=lambda p: int(p.name.split("-", 1)[1]),
@@ -71,7 +147,8 @@ def load(path: Path) -> Result:
         if not log.exists():
             raise ValueError(f"missing {log}")
         found = 0
-        for line in log.read_text(errors="replace").splitlines():
+        log_text = log.read_text(errors="replace")
+        for line in log_text.splitlines():
             match = ROW_RE.match(line.strip())
             if not match:
                 continue
@@ -93,12 +170,14 @@ def load(path: Path) -> Result:
             found += 1
         if found == 0:
             raise ValueError(f"no benchmark CSV rows in {log}")
+        resources.append(run_resources(run_dir, log_text, meta))
     return Result(
         path=path,
         label=meta.get("run_name", path.name),
         profile=meta.get("profile", "unknown"),
         sha=meta.get("git_sha", "unknown")[:12],
         rows=rows,
+        resources=resources,
     )
 
 
@@ -120,6 +199,12 @@ def fmt_range(vals: list[float], decimals: int = 2) -> str:
     return f"{median:.{decimals}f} [{min(vals):.{decimals}f}..{max(vals):.{decimals}f}]"
 
 
+def fmt_optional_range(values: list[int | float], suffix: str = "") -> str:
+    if not values:
+        return "n/a"
+    return f"{fmt_range([float(value) for value in values], 0)}{suffix}"
+
+
 def describe(result: Result) -> None:
     print(f"run={result.label} profile={result.profile} sha={result.sha} path={result.path}")
     print("ctx  samples  prefill_tps median[range]  gen_tps median[range]  "
@@ -133,6 +218,24 @@ def describe(result: Result) -> None:
             f"{ctx:<5} {len(p):<7} {fmt_range(p):<27} {fmt_range(g):<24} "
             f"{fmt_range(s):<27} {fmt_range(f, 1)}"
         )
+    local = [r.local_slots for r in result.resources if r.local_slots is not None]
+    peer = [r.peer_slots for r in result.resources if r.peer_slots is not None]
+    disk = [r.disk_read_bytes for r in result.resources if r.disk_read_bytes is not None]
+    gpu_ids = sorted({gpu for r in result.resources for gpu in r.gpu_peak_mib})
+    gpu_parts = []
+    for gpu in gpu_ids:
+        peak_values = [
+            r.gpu_peak_mib[gpu] for r in result.resources if gpu in r.gpu_peak_mib
+        ]
+        gpu_parts.append(
+            f"gpu{gpu}_peak={fmt_optional_range(peak_values, ' MiB')}"
+        )
+    gpu_text = " ".join(gpu_parts)
+    disk_text = fmt_range([value / (1024 ** 3) for value in disk], 2) + " GiB" if disk else "n/a"
+    print(
+        f"resources local_slots={fmt_optional_range(local)} "
+        f"peer_slots={fmt_optional_range(peer)} disk_read={disk_text} {gpu_text}".rstrip()
+    )
 
 
 def delta(old: float, new: float) -> str:
