@@ -48,9 +48,18 @@ Use `make` for build validation. Use `make test` for unit/regression tests when 
 model and Metal are available. Use live server tests only when intentionally
 testing the API surface.
 
+For the full change → build → validate → merge loop on this fork — including the
+CUDA/V100 (`sm_70`) build and the fast-equivalence A/B — see
+[DEVELOPMENT.md](DEVELOPMENT.md); the validation recipes are in
+[VALIDATION.md](VALIDATION.md).
+
 At every major change where one of the following could be affected, make sure to:
 
 1. Test the normal Metal path and that speed is still at the level it was.
 2. Test the SSD streaming path.
 3. Test the distributed inference if it could be affected, but ask the user before doing so.
-4. Check if CUDA could be broken after the change, and ask the user to give you access to the CUDA machine to actually test if everything is still fine.
+4. If the change could affect CUDA, build for `sm_70` in the CUDA 12.9 container
+   and run the matching validation tier — the fast-equivalence A/B for host-side
+   non-numeric changes, the full fixture (VALIDATION.md §9) for anything touching
+   kernel math. The V100 box builds and tests locally now (see DEVELOPMENT.md);
+   no need to ask for remote access.

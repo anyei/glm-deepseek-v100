@@ -98,6 +98,9 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
+- [DEVELOPMENT.md](DEVELOPMENT.md): the fork's dev workflow — branch, build
+  (`sm_70` in the CUDA 12.9 container), the change-type→validation-tier table,
+  the fast-equivalence A/B recipe, and the merge discipline.
 - [ROADMAP.md](ROADMAP.md): the fork's prioritized "what next" — the ops
   items to make the merge deployable and the performance-phase levers.
   VOLTA.md/VALIDATION.md are its detailed backlog.
