@@ -81,7 +81,13 @@ expert-pattern probe is recorded.
 
 ### 1.3 Canonical benchmark harness
 
-Add `speed-bench/v100_ab.sh` or an equivalent small harness that records:
+**Status: implemented.** `speed-bench/v100_bench.sh` covers single-GPU,
+passive-peer, and distributed profiles; `speed-bench/v100_compare.py` reports
+median/range and old-vs-new deltas. Functional smokes passed for all three
+profiles. The harness also refuses canonical runs on a busy/swapping host unless
+explicitly overridden.
+
+The harness records:
 
 - git SHA and binary hash;
 - model path/hash/size;
@@ -516,11 +522,12 @@ commit. Their performance attribution and rollback paths must remain separate.
 
 ## 12. Immediate next action
 
-The next coding task should be **Phase 0.3, the canonical benchmark harness**,
-followed by the Phase 1 architecture/cache sweep. It produces the baseline
-needed to decide whether owner-side compute, cache policy, or disk layout is
-actually the first implementation win for DeepSeek on this exact host.
+The next task is the **Phase 1 architecture/cache sweep** using the completed
+harness. Do not record canonical performance until its idle-host preflight
+passes. The sweep provides the baseline needed to decide whether owner-side
+compute, cache policy, or disk layout is the first implementation win for
+DeepSeek on this exact host.
 
-Do not start by writing peer kernels. First make the current three
-architectures reproducibly comparable and capture expert traces that can prove
-a cache policy before placing it in the hot path.
+Do not start by writing peer kernels. First compare the current three
+architectures reproducibly, then capture expert traces that can prove a cache
+policy before placing it in the hot path.

@@ -27,6 +27,55 @@ python3 speed-bench/plot_speed.py speed-bench/m3_max.csv --title "M3 Max t/s"
 The script uses only the Python standard library. By default it writes a file
 next to the CSV using the `_ts.svg` suffix, such as `speed-bench/m3_max_ts.svg`.
 
+## Reproducible V100 architecture A/B
+
+`v100_bench.sh` runs the fork's three current deployment profiles with the same
+model, prompt, context sweep, and token count. It captures binary/model
+identity, host/GPU metadata, raw logs, GPU telemetry, and diskstats under the
+ignored `speed-bench/local-runs/` directory.
+
+```sh
+# Canonical single-GPU baseline: one warm-up, then three measured processes.
+DS4_MODEL=/absolute/path/to/DeepSeek-V4-Flash.gguf \
+DS4_CACHE=8GB DS4_CTX_START=256 DS4_CTX_MAX=256 \
+DS4_GEN_TOKENS=96 DS4_WARMUPS=1 DS4_RUNS=3 \
+  speed-bench/v100_bench.sh single flash-main
+
+# GPU0 computes; GPU1 supplies a 26 GiB passive expert-cache tier.
+DS4_MODEL=/absolute/path/to/DeepSeek-V4-Flash.gguf \
+DS4_CACHE=24GB DS4_PEER_CACHE_GB=26 \
+  speed-bench/v100_bench.sh peer flash-peer
+
+# Existing whole-layer architecture, with CUDA IPC/NVLink activations.
+DS4_MODEL=/absolute/path/to/DeepSeek-V4-Flash.gguf \
+DS4_COORD_LAYERS=0:21 DS4_WORKER_LAYERS=22:output \
+DS4_COORD_CACHE=8GB DS4_WORKER_CACHE=8GB \
+  speed-bench/v100_bench.sh distributed flash-dist
+```
+
+Use `DS4_BINARY_DIR=/path/to/worktree` to benchmark a binary built in another
+worktree. Set `DS4_HASH_MODEL=1` for a canonical run, or pass a previously known
+hash as `DS4_MODEL_SHA256`; hashing is opt-in because the tested GGUFs are
+81–245 GiB. Sensitive environment values containing `KEY`, `TOKEN`, `SECRET`,
+or `PASSWORD` are redacted from metadata. Each measured process emits normal
+`ds4-bench` CSV rows. The harness summarizes their median and range
+automatically; compare two completed run directories with:
+
+```sh
+python3 speed-bench/v100_compare.py \
+  speed-bench/local-runs/<old-run> \
+  speed-bench/local-runs/<new-run>
+```
+
+Run `speed-bench/v100_bench.sh` without arguments for every override. Before a
+real run, the harness requires at least 80% CPU idle, no swap-in/out during its
+one-second sample, and idle GPUs using at most 512 MiB each. Stop competing
+builds and model servers rather than contaminating a canonical result;
+`DS4_ALLOW_BUSY=1` is available only for explicitly non-canonical smoke tests.
+Set `DS4_DRY_RUN=1` to validate and print container commands without occupying
+the GPUs. Performance claims should use at least 96 generated tokens and three
+measured runs; shorter runs are smoke tests only.
+
 ## Disk read throughput (`io_probe.c`)
 
 Streaming inference is disk-bound, so the NVMe read rate is a first-class
