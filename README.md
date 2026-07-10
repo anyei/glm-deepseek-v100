@@ -104,6 +104,11 @@ next sections.
 - [ROADMAP.md](ROADMAP.md): the fork's prioritized "what next" — the ops
   items to make the merge deployable and the performance-phase levers.
   VOLTA.md/VALIDATION.md are its detailed backlog.
+- [V100_ARCHITECTURE_ANALYSIS.md](V100_ARCHITECTURE_ANALYSIS.md): hardware-
+  specific analysis of the best streaming architecture for this two-V100 host,
+  including the case for exclusive expert ownership and owner-side MoE compute.
+- [V100_IMPLEMENTATION_PLAN.md](V100_IMPLEMENTATION_PLAN.md): the gated,
+  benchmark-first implementation sequence derived from that analysis.
 - [VOLTA.md](VOLTA.md): this fork's V100/Volta notes — the GLM 5.2 CUDA
   port, the FP16 tensor-core GEMM path, streaming expert-cache tiers, and
   the NVLink GPU IPC transport, with measured numbers.
