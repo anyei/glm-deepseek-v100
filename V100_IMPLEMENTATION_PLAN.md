@@ -562,6 +562,17 @@ ownership, and old/new score comparison.
 
 ### 7.1 Sidecar format
 
+**Status: format planner implemented; construction pending review.**
+`gguf-tools/expert-sidecar.py --plan` parses GGUF v3 metadata/tensor tables,
+recognizes both DS4 and HF-style routed tensor names, computes quantized payload
+sizes from GGUF block geometry, validates every layer's gate/up/down expert
+count, and lays out 4 KiB-aligned `gate | up | down` records. For the current
+DeepSeek file it found 43 layers, 11,008 experts, 77,913,391,104 payload bytes,
+and a 77,914,804,224-byte sidecar. Building it would leave about 93 GiB free on
+this filesystem, still above the 15–20% storage margin. The construction path is
+deliberately disabled until the v1 header/directory and resumability mechanics
+are reviewed; no 78 GB file has been written yet.
+
 Implement an offline tool that copies exact expert tensor bytes into an
 O_DIRECT-friendly sidecar:
 

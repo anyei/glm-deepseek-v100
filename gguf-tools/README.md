@@ -13,6 +13,20 @@ The important pieces are:
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
+- `expert-sidecar.py`: planner for the aligned expert-streaming sidecar format.
+
+## Plan An Expert Sidecar
+
+Inspect routed tensors and calculate the exact aligned sidecar size without
+writing model data:
+
+```sh
+python3 gguf-tools/expert-sidecar.py /path/to/model.gguf --plan
+```
+
+The planner validates gate/up/down geometry and reports source payload and final
+4 KiB-aligned size. The construction path is intentionally disabled pending
+format review, so this command cannot accidentally create an 80+ GB file.
 
 ## Build
 
