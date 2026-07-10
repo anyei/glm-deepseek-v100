@@ -138,7 +138,13 @@ replayed 45,472 hits, 16,466 misses and 116,544,503,808 bytes; none of segmented
 LRU, TinyLFU, equal layer quotas, decode protection, owner balancing, or top-K
 replication reduced bytes, so runtime cache-policy work fails its 20% gate on
 this workload. See `speed-bench/v100_architecture.csv` and
-`V100_IMPLEMENTATION_PLAN.md` for qualifications.
+`V100_IMPLEMENTATION_PLAN.md` for qualifications. A subsequent all-peer
+DeepSeek diagnostic computed six peer-owned slots directly on GPU1 and returned
+unreduced rows with exact GPU0 equality. Across three runs its isolated
+activation+compute+return+estimated-join path was 26–36% faster than measured
+peer-weight-copy plus GPU0 MoE, passing the prototype's 15% microbenchmark gate.
+It remains duplicate diagnostic compute, not a deployment claim; end-to-end
+replacement is still required before exclusive ownership.
 
 Recorded measurements include:
 

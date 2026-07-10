@@ -403,6 +403,12 @@ This is the highest-risk/highest-upside phase. Keep it narrow.
 
 ### 5.1 Narrow peer-expert context
 
+**Status: diagnostic prototype implemented (2026-07-10).**
+`DS4_CUDA_PEER_OWNER_PROBE=1` creates a narrow peer context only when requested;
+it retains peer activation, routing, quantized-intermediate and per-slot output
+buffers plus timing events, then tears them down on exit. It does not alter
+normal tensor ownership, cache placement, or model output.
+
 In `ds4_cuda.cu`, introduce a peer-expert runtime containing:
 
 - peer device ID;
@@ -417,6 +423,14 @@ Do not change generic `ds4_gpu_tensor` ownership in the prototype. Avoid a
 project-wide multi-device abstraction until the feature proves useful.
 
 ### 5.2 First prototype scope
+
+**Status: all-peer-hit DeepSeek decode microbenchmark complete.** With local
+cache forced to one slot for test coverage, 773 of 774 routed calls had all six
+selected experts in peer slots. The probe copied the activation and routing
+weights to GPU1, ran the existing IQ2_XXS gate/up plus Q2_K down decode kernels
+directly against peer-owned arenas, and returned six unreduced F32 slot rows.
+The shipping path still ran normally on GPU0; this was duplicate diagnostic
+compute only.
 
 Choose one model and one simple path:
 
@@ -434,6 +448,12 @@ measures launch/event/activation overhead. It may not be the final cache design.
 
 ### 5.3 Correctness mechanics
 
+The probe requires `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1` so GPU0 retains its
+per-slot baseline rows. Across three runs, all returned peer rows matched GPU0
+exactly (`max_delta=0`, `RMS=0`). Any peer allocation, transfer, launch, event,
+or comparison error fails the routed layer while the diagnostic is enabled.
+Normal execution remains unaffected when the environment gate is absent.
+
 - Reuse existing routed-MoE dot kernels where possible, but add an unreduced
   output mode that preserves one vector per router slot.
 - Preserve router-slot identity across compaction and peer dispatch.
@@ -444,6 +464,19 @@ measures launch/event/activation overhead. It may not be the final cache design.
 - Any peer CUDA error fails the layer; no partial fallback after compute begins.
 
 ### 5.4 Microbenchmarks
+
+**Isolated gate result: pass; end-to-end replacement gate still pending.** Three
+runs each measured 773 all-peer calls. Owner-side means were 0.195–0.206 ms:
+activation/control 0.018–0.024 ms, compute 0.165–0.169 ms, and six-slot return
+0.012–0.013 ms. The matching passive path measured GPU0 MoE plus peer-hit
+classify/weight copies at 0.273–0.331 ms. Adding the measured 0.0055 ms
+canonical join leaves a 26.4–36.1% reduction (35.6% median), above the 15%
+isolated gate. Results are tracked in `speed-bench/v100_peer_owner_probe.csv`.
+A separate shipping direct-sum run measured 0.346 ms for
+peer-copy plus GPU0 MoE, so the comparison is not relying on a slower baseline
+kernel. These are context-16 diagnostic microbenchmarks, not an end-to-end t/s
+claim. Do not start Phase 5 until an actual replacement mode demonstrates no
+token-time regression.
 
 Measure per layer:
 
@@ -662,13 +695,14 @@ commit. Their performance attribution and rollback paths must remain separate.
 
 ## 12. Immediate next action
 
-The DeepSeek Phase 1 decision, Phase 2 hot-path work, and Phase 3 policy
-simulation are complete. The corrected passive-peer profile is the release
-path at 4.25 steady t/s. Phase 3's runtime-policy gate failed (0% best byte
-reduction), so skip Phase 3.3. The next gated task is **Phase 4's narrow
-peer-owner compute prototype** only if its microbenchmark can beat passive
-peer-copy by 15%; do not begin broad exclusive-ownership refactoring first.
-GLM fixture validation remains queued until the model is restored.
+The corrected passive-peer profile remains the release path at 4.25 steady
+t/s, and Phase 3 runtime policy remains skipped. Phase 4's duplicate-compute
+all-peer microbenchmark passed its isolated gate with a 35.6% median reduction
+and exact slot outputs. The next task is a still-gated **DeepSeek decode
+replacement mode** that uses those peer rows in the canonical GPU0 join and
+measures end-to-end token time. Keep it diagnostic and all-peer only. Do not
+start Phase 5 mixed/exclusive ownership unless replacement mode has no token
+regression. GLM fixture validation remains queued until the model is restored.
 
 Do not start peer-owner kernels yet. Capture representative decode traces with
 the new opt-in format, then build the offline simulator before changing cache

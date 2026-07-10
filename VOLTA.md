@@ -191,6 +191,18 @@ replication saved 0%; equal per-layer quotas regressed bytes 1.38%. Useful
 policies saw no eviction, and prefill did not populate the global cache. Cache
 policy therefore fails its 20% implementation gate on this workload.
 
+An opt-in all-peer owner-compute probe now duplicates DeepSeek decode MoE on
+GPU1 without changing shipping output (`DS4_CUDA_PEER_OWNER_PROBE=1`, together
+with `DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1` for per-slot comparison). Three runs
+measured 773 all-peer calls each. GPU0 activation/control transfer took
+0.018–0.024 ms, peer compute 0.165–0.169 ms, and six unreduced slot rows returned
+in 0.012–0.013 ms; every slot was exactly equal to the GPU0 baseline. Including
+the measured 0.0055 ms canonical join, owner compute was 26.4–36.1% below measured
+peer-weight-copy plus GPU0-MoE time. This passes the isolated 15% gate but is not
+an end-to-end speed claim: passive peer remains production until a replacement
+mode demonstrates no token regression. Raw summary values are tracked in
+`speed-bench/v100_peer_owner_probe.csv`.
+
 The whole-layer distributed profile completed a full 96-token screening run at
 only 0.14 steady t/s and about 980 GiB of combined backing-device reads. That is
 roughly 27x slower than passive peer; it was stopped before three repetitions

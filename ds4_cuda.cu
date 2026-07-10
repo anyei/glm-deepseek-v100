@@ -242,6 +242,10 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static cuda_stream_selected_cache g_stream_selected_cache;
+/* Compact expert index -> owning global-cache slot. Diagnostic peer-owner
+ * probes consume this host directory; -1 means a direct/non-cache load. */
+static std::vector<int32_t> g_stream_selected_cache_slots;
+static int cuda_peer_moe_probe_enabled(void);
 static cuda_stream_expert_cache g_stream_expert_cache;
 static int g_cuda_device = 0;
 static uint32_t g_stream_expert_budget_override;
@@ -4171,6 +4175,15 @@ static int cuda_stream_selected_cache_begin_compact_load(
     uint32_t direct_loads = 0;
     uint32_t host_hits = 0;
     uint32_t host_reserved = 0;
+    const int peer_probe = cuda_peer_moe_probe_enabled();
+    g_stream_selected_cache_slots.clear();
+    if (peer_probe) {
+        try {
+            g_stream_selected_cache_slots.assign(compact_count, -1);
+        } catch (...) {
+            return strict_failure ? 0 : 1;
+        }
+    }
     const int host_cache =
         !expert_cache_disabled &&
         cuda_host_expert_cache_prepare(gate_expert_bytes, down_expert_bytes);
@@ -4254,6 +4267,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
                                               down_expert_bytes);
             if (cache_slot >= 0) {
                 cache_hits++;
+                if (peer_probe) g_stream_selected_cache_slots[i] = cache_slot;
                 if (trace_on) {
                     const int peer = (uint32_t)cache_slot >=
                         expert_cache->local_capacity;
@@ -4296,6 +4310,7 @@ static int cuda_stream_selected_cache_begin_compact_load(
                         gate_expert_bytes * 2u + down_expert_bytes };
                 }
                 cuda_stream_expert_cache_unindex_slot(expert_cache, slot);
+                if (peer_probe) g_stream_selected_cache_slots[i] = (int32_t)slot;
                 entry.valid = 1;
                 entry.model_map = model_map;
                 entry.model_size = model_size;
@@ -13817,6 +13832,214 @@ static int cuda_glm_experimental_mode(void) {
     return cached;
 }
 
+struct cuda_peer_moe_probe_state {
+    int checked, enabled, initialized, peer_device;
+    void *x, *weights, *selected, *xq, *gate, *up, *mid, *midq, *outputs;
+    void *local_outputs;
+    size_t x_cap, weights_cap, selected_cap, xq_cap;
+    size_t gate_cap, up_cap, mid_cap, midq_cap, output_cap, local_output_cap;
+    cudaEvent_t start, activation_done, compute_done, return_done;
+    uint64_t calls, skipped;
+    double activation_ms, compute_ms, return_ms;
+    double max_delta, rms_sum;
+};
+static cuda_peer_moe_probe_state g_peer_moe_probe;
+
+static void cuda_peer_moe_probe_print(void) {
+    if (g_peer_moe_probe.calls) {
+        const double n = (double)g_peer_moe_probe.calls;
+        fprintf(stderr,
+            "ds4: CUDA peer-owner probe calls=%llu skipped=%llu mean activation=%.3f ms compute=%.3f ms return=%.3f ms total=%.3f ms max_delta=%.8g mean_rms=%.8g\n",
+            (unsigned long long)g_peer_moe_probe.calls,
+            (unsigned long long)g_peer_moe_probe.skipped,
+            g_peer_moe_probe.activation_ms / n,
+            g_peer_moe_probe.compute_ms / n,
+            g_peer_moe_probe.return_ms / n,
+            (g_peer_moe_probe.activation_ms + g_peer_moe_probe.compute_ms +
+             g_peer_moe_probe.return_ms) / n,
+            g_peer_moe_probe.max_delta, g_peer_moe_probe.rms_sum / n);
+    }
+    const int local = g_cuda_device;
+    if (g_peer_moe_probe.peer_device >= 0 &&
+        cudaSetDevice(g_peer_moe_probe.peer_device) == cudaSuccess) {
+        if (g_peer_moe_probe.start) (void)cudaEventDestroy(g_peer_moe_probe.start);
+        if (g_peer_moe_probe.activation_done) (void)cudaEventDestroy(g_peer_moe_probe.activation_done);
+        if (g_peer_moe_probe.compute_done) (void)cudaEventDestroy(g_peer_moe_probe.compute_done);
+        if (g_peer_moe_probe.return_done) (void)cudaEventDestroy(g_peer_moe_probe.return_done);
+        void *peer_ptrs[] = { g_peer_moe_probe.x, g_peer_moe_probe.weights,
+            g_peer_moe_probe.selected, g_peer_moe_probe.xq,
+            g_peer_moe_probe.gate, g_peer_moe_probe.up, g_peer_moe_probe.mid,
+            g_peer_moe_probe.midq, g_peer_moe_probe.outputs };
+        for (void *ptr : peer_ptrs) if (ptr) (void)cudaFree(ptr);
+    }
+    if (cudaSetDevice(local) == cudaSuccess && g_peer_moe_probe.local_outputs) {
+        (void)cudaFree(g_peer_moe_probe.local_outputs);
+    }
+}
+
+static int cuda_peer_moe_probe_enabled(void) {
+    if (!g_peer_moe_probe.checked) {
+        g_peer_moe_probe.checked = 1;
+        const char *env = getenv("DS4_CUDA_PEER_OWNER_PROBE");
+        g_peer_moe_probe.enabled = env && env[0] && strcmp(env, "0") != 0;
+        if (g_peer_moe_probe.enabled) atexit(cuda_peer_moe_probe_print);
+    }
+    return g_peer_moe_probe.enabled;
+}
+
+static int cuda_peer_probe_alloc(void **ptr, size_t *cap, size_t bytes) {
+    if (*ptr && *cap >= bytes) return 1;
+    if (*ptr) (void)cudaFree(*ptr);
+    *ptr = NULL; *cap = 0;
+    if (cudaMalloc(ptr, bytes) != cudaSuccess) {
+        (void)cudaGetLastError(); return 0;
+    }
+    *cap = bytes; return 1;
+}
+
+/* Diagnostic duplicate execution only: compute peer-resident selected slots on
+ * their owner V100, return unreduced slot rows, and compare them with the normal
+ * GPU0 per-slot path. It never changes model output or cache ownership. */
+static int cuda_peer_moe_probe_run(
+        const ds4_gpu_tensor *x, const ds4_gpu_tensor *weights,
+        const ds4_gpu_tensor *down, uint32_t expert_in_dim,
+        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_expert,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, float clamp) {
+    if (!cuda_peer_moe_probe_enabled()) return 1;
+    if (!getenv("DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6")) {
+        static int warned;
+        if (!warned++) fprintf(stderr,
+            "ds4: CUDA peer-owner probe requires DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1\n");
+        g_peer_moe_probe.skipped++; return 1;
+    }
+    cuda_stream_expert_cache *cache = &g_stream_expert_cache;
+    if (!cache->valid || cache->peer_device < 0 || !cache->peer_gate_ptr ||
+        g_stream_selected_cache.slot_count < n_expert ||
+        g_stream_selected_cache_slots.size() < g_stream_selected_cache.compact_count) {
+        g_peer_moe_probe.skipped++; return 1;
+    }
+    int32_t compact_ids[32];
+    float host_weights[32];
+    if (n_expert > 32 ||
+        cudaMemcpy(compact_ids, g_stream_selected_cache.slot_selected_tensor.ptr,
+                   n_expert * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(host_weights, weights->ptr, n_expert * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void)cudaGetLastError(); return 0;
+    }
+    int32_t peer_ids[32]; uint32_t original_slots[32]; float peer_weights[32];
+    uint32_t peer_count = 0;
+    for (uint32_t slot = 0; slot < n_expert; slot++) {
+        const int32_t compact = compact_ids[slot];
+        if (compact < 0 || (size_t)compact >= g_stream_selected_cache_slots.size()) continue;
+        const int32_t owner_slot = g_stream_selected_cache_slots[(size_t)compact];
+        if (owner_slot < (int32_t)cache->local_capacity) continue;
+        peer_ids[peer_count] = owner_slot - (int32_t)cache->local_capacity;
+        original_slots[peer_count] = slot;
+        peer_weights[peer_count] = host_weights[slot];
+        peer_count++;
+    }
+    /* Phase-4's first gate is deliberately all-peer: mixed ownership needs a
+     * canonical GPU0 join and belongs only after this simpler case wins. */
+    if (peer_count != n_expert) { g_peer_moe_probe.skipped++; return 1; }
+
+    const int local_device = g_cuda_device, peer_device = cache->peer_device;
+    const size_t x_bytes = (size_t)expert_in_dim * sizeof(float);
+    const size_t pair_bytes = (size_t)peer_count * sizeof(float);
+    const uint32_t xq_blocks = expert_in_dim / CUDA_QK_K;
+    const uint32_t midq_blocks = expert_mid_dim / CUDA_QK_K;
+    const size_t xq_bytes = (size_t)xq_blocks * sizeof(cuda_block_q8_K);
+    const size_t mid_bytes = (size_t)peer_count * expert_mid_dim * sizeof(float);
+    const size_t midq_bytes = (size_t)peer_count * midq_blocks * sizeof(cuda_block_q8_K);
+    const size_t output_bytes = (size_t)peer_count * out_dim * sizeof(float);
+    if (cudaDeviceSynchronize() != cudaSuccess || cudaSetDevice(peer_device) != cudaSuccess) return 0;
+    cudaError_t access = cudaDeviceEnablePeerAccess(local_device, 0);
+    if (access == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+    else if (access != cudaSuccess) { (void)cudaSetDevice(local_device); return 0; }
+    if (!cuda_peer_probe_alloc(&g_peer_moe_probe.x, &g_peer_moe_probe.x_cap, x_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.weights, &g_peer_moe_probe.weights_cap, pair_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.selected, &g_peer_moe_probe.selected_cap, peer_count * sizeof(int32_t)) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.xq, &g_peer_moe_probe.xq_cap, xq_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.gate, &g_peer_moe_probe.gate_cap, mid_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.up, &g_peer_moe_probe.up_cap, mid_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.mid, &g_peer_moe_probe.mid_cap, mid_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.midq, &g_peer_moe_probe.midq_cap, midq_bytes) ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.outputs, &g_peer_moe_probe.output_cap, output_bytes)) {
+        (void)cudaSetDevice(local_device); return 0;
+    }
+    if (!g_peer_moe_probe.initialized) {
+        if (cudaEventCreate(&g_peer_moe_probe.start) != cudaSuccess ||
+            cudaEventCreate(&g_peer_moe_probe.activation_done) != cudaSuccess ||
+            cudaEventCreate(&g_peer_moe_probe.compute_done) != cudaSuccess ||
+            cudaEventCreate(&g_peer_moe_probe.return_done) != cudaSuccess) {
+            (void)cudaSetDevice(local_device); return 0;
+        }
+        g_peer_moe_probe.initialized = 1; g_peer_moe_probe.peer_device = peer_device;
+    }
+    (void)cudaEventRecord(g_peer_moe_probe.start, 0);
+    if (cudaMemcpyPeerAsync(g_peer_moe_probe.x, peer_device, x->ptr, local_device, x_bytes, 0) != cudaSuccess ||
+        cudaMemcpyAsync(g_peer_moe_probe.weights, peer_weights, pair_bytes, cudaMemcpyHostToDevice, 0) != cudaSuccess ||
+        cudaMemcpyAsync(g_peer_moe_probe.selected, peer_ids, peer_count * sizeof(int32_t), cudaMemcpyHostToDevice, 0) != cudaSuccess) {
+        (void)cudaSetDevice(local_device); return 0;
+    }
+    (void)cudaEventRecord(g_peer_moe_probe.activation_done, 0);
+    q8_K_quantize_kernel<<<dim3(xq_blocks, 1, 1), 256>>>(
+        (cuda_block_q8_K *)g_peer_moe_probe.xq, (const float *)g_peer_moe_probe.x,
+        expert_in_dim, 1);
+    dim3 qgrid((expert_mid_dim + 127u) / 128u, peer_count, 1);
+    moe_gate_up_mid_decode_lut_qwarp32_kernel<<<qgrid, 256>>>(
+        (float *)g_peer_moe_probe.gate, (float *)g_peer_moe_probe.up,
+        (float *)g_peer_moe_probe.mid, cache->peer_gate_ptr, cache->peer_up_ptr,
+        (const cuda_block_q8_K *)g_peer_moe_probe.xq,
+        (const int32_t *)g_peer_moe_probe.selected,
+        (const float *)g_peer_moe_probe.weights, gate_expert_bytes,
+        gate_row_bytes, xq_blocks, expert_mid_dim, peer_count, 0, clamp);
+    q8_K_quantize_kernel<<<dim3(midq_blocks, peer_count, 1), 256>>>(
+        (cuda_block_q8_K *)g_peer_moe_probe.midq,
+        (const float *)g_peer_moe_probe.mid, expert_mid_dim, peer_count);
+    dim3 dgrid((out_dim + 31u) / 32u, peer_count, 1);
+    moe_down_qwarp32_kernel<<<dgrid, 256>>>(
+        (float *)g_peer_moe_probe.outputs, cache->peer_down_ptr,
+        (const cuda_block_q8_K *)g_peer_moe_probe.midq,
+        (const int32_t *)g_peer_moe_probe.selected, down_expert_bytes,
+        down_row_bytes, midq_blocks, out_dim, peer_count);
+    if (cudaGetLastError() != cudaSuccess) { (void)cudaSetDevice(local_device); return 0; }
+    (void)cudaEventRecord(g_peer_moe_probe.compute_done, 0);
+    if (cudaSetDevice(local_device) != cudaSuccess ||
+        !cuda_peer_probe_alloc(&g_peer_moe_probe.local_outputs,
+                               &g_peer_moe_probe.local_output_cap, output_bytes) ||
+        cudaSetDevice(peer_device) != cudaSuccess ||
+        cudaMemcpyPeerAsync(g_peer_moe_probe.local_outputs, local_device,
+                            g_peer_moe_probe.outputs, peer_device,
+                            output_bytes, 0) != cudaSuccess) {
+        (void)cudaSetDevice(local_device); return 0;
+    }
+    (void)cudaEventRecord(g_peer_moe_probe.return_done, 0);
+    if (cudaEventSynchronize(g_peer_moe_probe.return_done) != cudaSuccess) {
+        (void)cudaSetDevice(local_device); return 0;
+    }
+    float a = 0, b = 0, c = 0;
+    (void)cudaEventElapsedTime(&a, g_peer_moe_probe.start, g_peer_moe_probe.activation_done);
+    (void)cudaEventElapsedTime(&b, g_peer_moe_probe.activation_done, g_peer_moe_probe.compute_done);
+    (void)cudaEventElapsedTime(&c, g_peer_moe_probe.compute_done, g_peer_moe_probe.return_done);
+    (void)cudaSetDevice(local_device);
+    std::vector<float> peer_out((size_t)peer_count * out_dim), base_out((size_t)n_expert * out_dim);
+    if (cudaMemcpy(peer_out.data(), g_peer_moe_probe.local_outputs, output_bytes, cudaMemcpyDeviceToHost) != cudaSuccess ||
+        cudaMemcpy(base_out.data(), down->ptr, (size_t)n_expert * out_dim * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) return 0;
+    double sq = 0; double max_delta = 0; uint64_t count = 0;
+    for (uint32_t p = 0; p < peer_count; p++) for (uint32_t j = 0; j < out_dim; j++) {
+        const double delta = (double)peer_out[(size_t)p * out_dim + j] -
+            base_out[(size_t)original_slots[p] * out_dim + j];
+        sq += delta * delta; max_delta = fmax(max_delta, fabs(delta)); count++;
+    }
+    g_peer_moe_probe.calls++; g_peer_moe_probe.activation_ms += a;
+    g_peer_moe_probe.compute_ms += b; g_peer_moe_probe.return_ms += c;
+    g_peer_moe_probe.max_delta = fmax(g_peer_moe_probe.max_delta, max_delta);
+    g_peer_moe_probe.rms_sum += sqrt(sq / (double)count);
+    return 1;
+}
+
 static int routed_moe_launch(
         ds4_gpu_tensor *out,
         ds4_gpu_tensor *gate,
@@ -14548,6 +14771,13 @@ static int routed_moe_launch(
                         n_tokens, pair_count, ms_xq, ms_sort, ms_gate, ms_midq, ms_down, ms_sum, ms_total);
             }
             for (uint32_t i = 0; i < 7u; i++) (void)cudaEventDestroy(prof_ev[i]);
+        }
+        if (ok && !q4k_path && n_tokens == 1u) {
+            ok = cuda_peer_moe_probe_run(x, weights, down, expert_in_dim,
+                                         expert_mid_dim, out_dim, n_expert,
+                                         gate_expert_bytes, gate_row_bytes,
+                                         down_expert_bytes, down_row_bytes,
+                                         clamp) != 0;
         }
         return ok;
     }

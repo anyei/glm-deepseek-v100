@@ -119,6 +119,26 @@ optional top-K replication. Reuse-distance percentiles and optional per-layer
 reports are included. The final line states whether the best alternative passes
 the 20% runtime-policy gate.
 
+## Peer-owner decode probe
+
+The Phase 4 diagnostic duplicates all-peer DeepSeek decode MoE on GPU1, returns
+unreduced slot rows, and compares them against GPU0 without changing generation:
+
+```sh
+DS4_CUDA_PEER_OWNER_PROBE=1 \
+DS4_CUDA_MOE_NO_DIRECT_DOWN_SUM6=1 \
+DS4_CUDA_STREAMING_EXPERT_CACHE_N=1 \
+DS4_CUDA_PEER_EXPERT_CACHE_GB=26 ./ds4-bench ...
+```
+
+The one-slot local setting is a test-only way to produce all-peer selections;
+do not use it as a deployment profile. The exit summary separates
+activation/control, peer compute, and slot-return milliseconds and reports
+max/RMS per-slot deltas. Use `DS4_CUDA_MOE_PROFILE=1` plus an expert trace for
+the passive peer-copy/GPU0 baseline. Results are in
+`v100_peer_owner_probe.csv`. This probe performs duplicate work and is not an
+end-to-end owner-compute mode.
+
 ## Disk read throughput (`io_probe.c`)
 
 Streaming inference is disk-bound, so the NVMe read rate is a first-class
