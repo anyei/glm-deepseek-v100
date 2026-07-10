@@ -526,7 +526,9 @@ static uint64_t cuda_parse_gb_env(const char *name) {
     char *end = NULL;
     errno = 0;
     unsigned long long v = strtoull(env, &end, 10);
-    if (end != env && errno == 0 && v <= 1024) return (uint64_t)v;
+    if (end != env && *end == '\0' && errno == 0 && v <= 1024) {
+        return (uint64_t)v;
+    }
     return 0;
 }
 
@@ -1776,8 +1778,10 @@ static uint32_t cuda_stream_expert_peer_budget_experts(
     const char *penv = getenv("DS4_CUDA_PEER_DEVICE");
     if (penv && penv[0]) {
         char *end = NULL;
+        errno = 0;
         long v = strtol(penv, &end, 10);
-        if (end != penv && v >= 0 && v < ndev && (int)v != g_cuda_device) {
+        if (end != penv && *end == '\0' && errno == 0 &&
+            v >= 0 && v < ndev && (int)v != g_cuda_device) {
             peer = (int)v;
         }
     }
@@ -1995,7 +1999,9 @@ static uint32_t cuda_stream_read_thread_count(void) {
         char *end = NULL;
         errno = 0;
         long v = strtol(env, &end, 10);
-        if (end != env && errno == 0 && v >= 0 && v <= 64) n = v;
+        if (end != env && *end == '\0' && errno == 0 && v >= 0 && v <= 64) {
+            n = v;
+        }
     }
     const long hw = (long)std::thread::hardware_concurrency();
     if (hw > 2 && n > hw - 2) n = hw - 2;
@@ -2233,8 +2239,8 @@ static int cuda_stream_read_batch(
  * decode path alone uses it — prefill chunks would flush it, exactly like
  * the GPU tier.
  *
- * DS4_CUDA_HOST_EXPERT_CACHE_GB sets the pinned budget (default 16,
- * clamped against MemAvailable minus a safety margin; 0 disables).
+ * DS4_CUDA_HOST_EXPERT_CACHE_GB sets the optional pinned budget, clamped
+ * against MemAvailable minus a safety margin; unset or 0 disables it.
  * ========================================================================= */
 
 typedef struct cuda_host_expert_slot {
@@ -3072,7 +3078,17 @@ extern "C" int ds4_gpu_init(void) {
      * GPU visible (CUDA IPC cannot map memory from a hidden device), so the
      * device is selected here instead of via CUDA_VISIBLE_DEVICES. */
     const char *dev_env = getenv("DS4_CUDA_DEVICE");
-    if (dev_env && *dev_env) dev = atoi(dev_env);
+    if (dev_env && *dev_env) {
+        char *end = NULL;
+        errno = 0;
+        long v = strtol(dev_env, &end, 10);
+        if (end == dev_env || *end != '\0' || errno != 0 ||
+            v < 0 || v > INT_MAX) {
+            fprintf(stderr, "ds4: invalid DS4_CUDA_DEVICE value: %s\n", dev_env);
+            return 0;
+        }
+        dev = (int)v;
+    }
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     g_cuda_device = dev;
     cudaDeviceProp prop;

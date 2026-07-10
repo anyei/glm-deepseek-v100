@@ -1281,6 +1281,129 @@ support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
 
+## Fork environment knobs
+
+This section lists only the runtime environment knobs introduced by this fork's
+V100, CUDA GLM, expert-cache, and NVLink commits. It is intentionally not a
+catalog of the environment variables inherited from upstream DwarfStar. Unless
+noted otherwise, presence-style gates conventionally use `=1`; their value is
+not parsed.
+
+### CUDA and GLM
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DS4_CUDA_NO_FP16_GEMM=1` | FP16 tensor-core GEMM enabled on `sm_7x` | Disable the fork's reduced-precision FP16 tensor-core path for FP32 GEMMs. `--quality` also disables it. Useful for quality/performance A/B tests. |
+| `DS4_CUDA_DEVICE=N` | `0` | Select the CUDA device for this process without hiding the other GPUs. Prefer this to `CUDA_VISIBLE_DEVICES` when CUDA IPC or the peer expert cache needs every GPU visible. |
+| `DS4_GLM_CUDA_DISABLE=1` | GLM CUDA enabled | Restore the old behavior that refuses GLM on CUDA. This replaced the removed development gate `DS4_GLM_CUDA_EXPERIMENTAL`. |
+| `DS4_GLM_DEBUG=1` | off | Print diagnostics for otherwise silent GLM CUDA argument/staging validation failures. |
+
+### SSD-streaming expert reads and cache tiers
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DS4_CUDA_STREAM_READ_THREADS=N` | `8` | Set expert-miss reader workers. Valid range is 0–64, further limited to leave two logical CPUs free. `0` selects the serial-read control path. |
+| `DS4_CUDA_HOST_EXPERT_CACHE_GB=N` | off | Allocate an integer-GiB pinned-host-RAM L2 expert cache. Use roughly 2× the local GPU expert-cache budget or more; pinned memory is not reclaimable. The allocation is capped to leave 6 GiB of `MemAvailable`. |
+| `DS4_CUDA_PEER_EXPERT_CACHE_GB=N` | off | Allocate an integer-GiB expert-cache extension on another visible GPU and mirror hits over P2P/NVLink. This is the preferred second tier on the two-V100 setup. |
+| `DS4_CUDA_PEER_DEVICE=N` | the other GPU (`0`→`1`, otherwise `0`) | Override the GPU used by `DS4_CUDA_PEER_EXPERT_CACHE_GB`. It must differ from `DS4_CUDA_DEVICE` and support bidirectional peer access. |
+| `DS4_CUDA_STREAM_STAGE_TIMING=1` | off | Collect staging attribution and print an aggregate `classify+hitD2D`, IO, miss-D2D, and upload summary when the process exits. Diagnostic use only. |
+
+The two cache-budget variables accept integer GiB values from 0 through 1024;
+unset, blank, malformed, and zero values disable their tier. Do not normally
+combine the host and peer tiers: with a large peer cache the measured residual
+host-cache hit rate was negligible. Keep `--ssd-streaming-cache-experts` high
+as well—local GPU-cache hits are cheaper than either second tier.
+
+### Distributed CUDA IPC
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DS4_DIST_NO_IPC=1` | IPC enabled when supported | Force distributed activations through TCP instead of the same-host CUDA IPC/NVLink path. Useful as an A/B or compatibility fallback. Set it on every process. |
+| `DS4_DIST_IPC_SLOTS=N` | `4` | Set the receiving CUDA IPC inbox depth. Positive integers are capped at 8; malformed and non-positive values use the default. |
+| `DS4_DIST_IPC_SLOT_BYTES=N` | `1048576` | Set bytes per IPC inbox slot. Positive values below 65536 are raised to 65536; values above `UINT32_MAX`, malformed values, and non-positive values use the default. |
+
+CUDA IPC requires all participating GPUs to remain visible and the processes to
+share compatible IPC/PID namespaces. The supplied [`docker-compose.yml`](docker-compose.yml)
+sets those requirements and uses `DS4_CUDA_DEVICE=0` for the coordinator and
+`DS4_CUDA_DEVICE=1` for the worker.
+
+### Examples
+
+The validated GLM configuration uses GPU 0 for compute and 26 GiB of GPU 1 as
+a peer expert cache. The supplied compose service wires
+`DS4_CUDA_PEER_EXPERT_CACHE_GB` from `DS4_GLM_PEER_CACHE`:
+
+```sh
+# Optional .env file read by Docker Compose:
+printf '%s\n' 'DS4_GLM_PEER_CACHE=26' > .env
+
+docker compose up glm
+```
+
+The equivalent direct-container pattern is:
+
+```sh
+docker run --rm --gpus all --ipc=host --pid=host --network=host \
+  -e DS4_CUDA_DEVICE=0 \
+  -e DS4_CUDA_PEER_EXPERT_CACHE_GB=26 \
+  -e DS4_CUDA_STREAM_READ_THREADS=8 \
+  -v /path/to/models:/models:ro \
+  ds4:sm70-ipc \
+  -m /models/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
+  --ssd-streaming --ssd-streaming-cache-experts 26GB \
+  --ctx 16384 --host 0.0.0.0 --port 8080
+```
+
+On a one-GPU machine with abundant host RAM, substitute a pinned-host tier for
+the peer tier. This example keeps the validated 26 GiB GPU budget and adds a
+28 GiB host cache (the host must have at least 34 GiB available for the full
+allocation and its 6 GiB safety margin):
+
+```sh
+docker run --rm --gpus '"device=0"' \
+  -e DS4_CUDA_HOST_EXPERT_CACHE_GB=28 \
+  -e DS4_CUDA_STREAM_READ_THREADS=8 \
+  -v /path/to/models:/models:ro \
+  --entrypoint /app/ds4 ds4:sm70-ipc \
+  -m /models/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 26GB \
+  --ctx 2048 --nothink -n 128 -p "Explain NVLink in one paragraph."
+```
+
+To force the supplied two-process compose stack onto TCP for comparison, use a
+small override file. The gate must be present in both services:
+
+```yaml
+# compose.tcp.yml
+services:
+  coordinator:
+    environment:
+      DS4_DIST_NO_IPC: "1"
+  worker:
+    environment:
+      DS4_DIST_NO_IPC: "1"
+```
+
+```sh
+docker compose -f docker-compose.yml -f compose.tcp.yml up
+```
+
+For native runs, place the variables directly before the command:
+
+```sh
+# Plain-FP32 quality/performance control on V100.
+DS4_CUDA_NO_FP16_GEMM=1 ./ds4-bench -m ds4flash.gguf --cuda
+
+# Diagnose GLM staging and print aggregate staging timing at exit.
+DS4_GLM_DEBUG=1 DS4_CUDA_STREAM_STAGE_TIMING=1 \
+  ./ds4 -m gguf/GLM-5.2-UD-Q2_K_RoutedQ2K.gguf \
+  --cuda --ssd-streaming --ssd-streaming-cache-experts 26GB \
+  --ctx 2048 --nothink -n 32 -p "Hello"
+```
+
+See [RUNNING.md](RUNNING.md) for complete deployment commands and
+[VOLTA.md](VOLTA.md) for measured cache sizing and performance tradeoffs.
+
 ## Steering
 
 This project supports steering with single-vector activation directions; see the

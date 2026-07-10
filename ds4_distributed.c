@@ -176,6 +176,7 @@ typedef struct ds4_dist_ipc_link {
     uint32_t slot_count;
     uint64_t slot_bytes;
     uint32_t next_slot;
+    uint32_t refs;
     pthread_mutex_t mu;
 } ds4_dist_ipc_link;
 
@@ -254,9 +255,9 @@ typedef struct ds4_dist_worker_entry {
     uint32_t ctx_size;
     uint32_t n_layers;
     uint32_t listen_port;
-    /* Mapped GPU IPC inbox of this worker, or NULL. Deliberately never
-     * freed on disconnect: in-flight route plans may still reference it
-     * and a stale mapping is tiny (a few MiB per reconnect cycle). */
+    /* Mapped GPU IPC inbox of this worker, or NULL. Route plans retain the
+     * link so disconnect/reconnect can release the registry's ownership
+     * without invalidating an in-flight request. */
     ds4_dist_ipc_link *ipc;
     struct ds4_dist_worker_entry *next;
 } ds4_dist_worker_entry;
@@ -1292,17 +1293,24 @@ static bool dist_ipc_enabled(void) {
 
 static uint32_t dist_ipc_slot_count_config(void) {
     const char *s = getenv("DS4_DIST_IPC_SLOTS");
-    long v = s ? strtol(s, NULL, 10) : 4;
-    if (v < 1) v = 1;
-    if (v > (long)DS4_DIST_IPC_MAX_SLOTS) v = DS4_DIST_IPC_MAX_SLOTS;
-    return (uint32_t)v;
+    uint32_t v = 4;
+    if (s && !dist_parse_positive_u32(s, "DS4_DIST_IPC_SLOTS",
+                                      &v, NULL, 0)) {
+        v = 4;
+    }
+    if (v > DS4_DIST_IPC_MAX_SLOTS) v = DS4_DIST_IPC_MAX_SLOTS;
+    return v;
 }
 
 static uint64_t dist_ipc_slot_bytes_config(void) {
     const char *s = getenv("DS4_DIST_IPC_SLOT_BYTES");
-    long long v = s ? strtoll(s, NULL, 10) : 1048576;
+    uint32_t v = 1048576;
+    if (s && !dist_parse_positive_u32(s, "DS4_DIST_IPC_SLOT_BYTES",
+                                      &v, NULL, 0)) {
+        v = 1048576;
+    }
     if (v < 65536) v = 65536;
-    return (uint64_t)v;
+    return v;
 }
 
 /* Process-global receive inbox, created lazily on first advertisement. */
@@ -1312,7 +1320,7 @@ static struct {
     void *dev;
     void *events[DS4_DIST_IPC_MAX_SLOTS];
     ds4_dist_ipc_advert adv;
-} g_dist_ipc_inbox = { PTHREAD_MUTEX_INITIALIZER, false, NULL, {0}, {{0}} };
+} g_dist_ipc_inbox = { .mu = PTHREAD_MUTEX_INITIALIZER };
 
 /* Returns the advert for the local inbox (slot_count 0 if unavailable). */
 static const ds4_dist_ipc_advert *dist_ipc_local_inbox(void) {
@@ -1374,6 +1382,7 @@ static ds4_dist_ipc_link *dist_ipc_link_open(const ds4_dist_ipc_advert *adv) {
     link->slot_count = adv->slot_count;
     link->slot_bytes = adv->slot_bytes;
     pthread_mutex_init(&link->mu, NULL);
+    link->refs = 1;
     for (uint32_t i = 0; i < adv->slot_count; i++) {
         link->events[i] = ds4_gpu_dist_ipc_open_event(adv->evt_handles[i]);
         if (!link->events[i]) {
@@ -1390,8 +1399,20 @@ static ds4_dist_ipc_link *dist_ipc_link_open(const ds4_dist_ipc_advert *adv) {
     return link;
 }
 
+static ds4_dist_ipc_link *dist_ipc_link_retain(ds4_dist_ipc_link *link) {
+    if (!link) return NULL;
+    pthread_mutex_lock(&link->mu);
+    link->refs++;
+    pthread_mutex_unlock(&link->mu);
+    return link;
+}
+
 static void dist_ipc_link_free(ds4_dist_ipc_link *link) {
     if (!link) return;
+    pthread_mutex_lock(&link->mu);
+    const bool destroy = --link->refs == 0;
+    pthread_mutex_unlock(&link->mu);
+    if (!destroy) return;
     for (uint32_t i = 0; i < link->slot_count; i++) {
         ds4_gpu_dist_ipc_close_event(link->events[i]);
     }
@@ -1432,6 +1453,9 @@ static bool dist_ipc_local_inbox_ready(void) { return false; }
 static ds4_dist_ipc_link *dist_ipc_link_open(const ds4_dist_ipc_advert *adv) {
     (void)adv;
     return NULL;
+}
+static ds4_dist_ipc_link *dist_ipc_link_retain(ds4_dist_ipc_link *link) {
+    return link;
 }
 static void dist_ipc_link_free(ds4_dist_ipc_link *link) { (void)link; }
 static int dist_ipc_link_acquire_slot(ds4_dist_ipc_link *link, uint64_t bytes) {
@@ -2188,6 +2212,7 @@ static void dist_coordinator_add_worker(
     ds4_dist_worker_entry *entry = calloc(1, sizeof(*entry));
     if (!entry) {
         DIST_COORD_DEBUG(state, "ds4: distributed coordinator: out of memory while registering worker\n");
+        dist_ipc_link_free(ipc);
         return;
     }
 
@@ -2209,6 +2234,7 @@ static void dist_coordinator_add_worker(
     pthread_mutex_lock(&state->mu);
     if (state->shutting_down) {
         pthread_mutex_unlock(&state->mu);
+        dist_ipc_link_free(entry->ipc);
         free(entry);
         return;
     }
@@ -2229,6 +2255,8 @@ static void dist_coordinator_add_worker(
                              old->layer_start,
                              old->layer_end,
                              old->has_output ? "+output" : "");
+            if (old->fd >= 0) shutdown(old->fd, SHUT_RDWR);
+            dist_ipc_link_free(old->ipc);
             free(old);
             continue;
         }
@@ -2408,6 +2436,7 @@ static void dist_route_plan_free(ds4_dist_route_plan *plan) {
     if (!plan) return;
     for (uint32_t i = 0; i < plan->count; i++) {
         if (plan->entry[i].fd >= 0) close(plan->entry[i].fd);
+        dist_ipc_link_free(plan->entry[i].ipc);
     }
     free(plan->entry);
     free(plan->blob);
@@ -2447,6 +2476,7 @@ static void dist_coordinator_forget_route_workers(
                              entry->layer_start,
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
+            dist_ipc_link_free(entry->ipc);
             free(entry);
             removed_any = true;
             break;
@@ -2619,6 +2649,7 @@ static bool dist_coordinator_build_route_plan(
             return false;
         }
         plan->entry = new_entries;
+        entry.ipc = dist_ipc_link_retain(entry.ipc);
         plan->entry[plan->count++] = entry;
         if (!dist_route_plan_append_blob(plan, &entry, err, errlen)) {
             pthread_mutex_unlock(&state->mu);
@@ -4470,6 +4501,7 @@ static void dist_coordinator_remove_worker(ds4_dist_coordinator_state *state, in
                              entry->layer_end,
                              entry->has_output ? "+output" : "");
             pthread_mutex_unlock(&state->mu);
+            dist_ipc_link_free(entry->ipc);
             free(entry);
             if (dist_coordinator_debug_enabled(state)) dist_coordinator_report_plan(state);
             return;
