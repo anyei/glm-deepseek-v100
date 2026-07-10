@@ -13,9 +13,10 @@ The important pieces are:
   importance with `ds4`.
 - `quality-testing/`: prompts and scripts used to compare local GGUF variants
   against official DeepSeek V4 Flash continuations.
-- `expert-sidecar.py`: planner for the aligned expert-streaming sidecar format.
+- `expert-sidecar.py`: planner, resumable builder, and verifier for the aligned
+  expert-streaming sidecar format.
 
-## Plan An Expert Sidecar
+## Expert Sidecars
 
 Inspect routed tensors and calculate the exact aligned sidecar size without
 writing model data:
@@ -24,9 +25,31 @@ writing model data:
 python3 gguf-tools/expert-sidecar.py /path/to/model.gguf --plan
 ```
 
-The planner validates gate/up/down geometry and reports source payload and final
-4 KiB-aligned size. The construction path is intentionally disabled pending
-format review, so this command cannot accidentally create an 80+ GB file.
+Construction requires an explicit `--build`, computes the model SHA-256 before
+copying, reserves the complete output size, and writes `OUTPUT.part`. A synced,
+complete file is atomically published as `OUTPUT`; an existing output is never
+overwritten. Use `--resume` after interruption:
+
+```sh
+python3 gguf-tools/expert-sidecar.py MODEL.gguf MODEL.experts --build
+python3 gguf-tools/expert-sidecar.py MODEL.gguf MODEL.experts --build --resume
+python3 gguf-tools/expert-sidecar.py MODEL.gguf MODEL.experts --verify
+```
+
+`--model-sha256 HEX` avoids hashing the full GGUF again when a trusted digest is
+already available. `--alignment` accepts powers of two from 4 KiB upward, so the
+planned 1, 4, and 16 MiB I/O experiments do not require another format.
+
+Format v1 is little-endian. It has a 4 KiB header, a packed array of 128-byte
+records, and aligned payload records. The header identifies the source by size,
+mtime, and SHA-256 and authenticates the complete directory. Each directory
+record contains `(layer, expert)`, absolute offsets and lengths for gate/up/down,
+and the SHA-256 of their concatenated exact GGUF bytes. A record starts on the
+requested alignment; gate, up, and down are contiguous within it. Padding has no
+semantic content. During resumable construction payload data is synced before
+its completed directory entries, and final publication occurs only after the
+complete header and directory are synced. `--verify` rehashes both the GGUF
+source ranges and sidecar payloads.
 
 ## Build
 

@@ -562,16 +562,26 @@ ownership, and old/new score comparison.
 
 ### 7.1 Sidecar format
 
-**Status: format planner implemented; construction pending review.**
-`gguf-tools/expert-sidecar.py --plan` parses GGUF v3 metadata/tensor tables,
-recognizes both DS4 and HF-style routed tensor names, computes quantized payload
-sizes from GGUF block geometry, validates every layer's gate/up/down expert
-count, and lays out 4 KiB-aligned `gate | up | down` records. For the current
-DeepSeek file it found 43 layers, 11,008 experts, 77,913,391,104 payload bytes,
-and a 77,914,804,224-byte sidecar. Building it would leave about 93 GiB free on
-this filesystem, still above the 15–20% storage margin. The construction path is
-deliberately disabled until the v1 header/directory and resumability mechanics
-are reviewed; no 78 GB file has been written yet.
+**Status: v1 planner, resumable builder, and verifier implemented; full-size
+construction pending model availability.** `gguf-tools/expert-sidecar.py` parses
+GGUF v2/v3 metadata and tensor tables, recognizes both DS4 and HF-style routed
+tensor names, computes quantized payload sizes from GGUF block geometry,
+validates every layer's gate/up/down expert count, and lays out aligned
+`gate | up | down` records. Format v1 has a 4 KiB identity header, 128-byte
+per-expert directory records, a model and directory SHA-256, and a payload
+SHA-256 per expert. Construction preallocates `OUTPUT.part`, durably checkpoints
+payload before publishing directory entries, resumes at the first incomplete
+entry, and uses a no-replace hard-link publication after the complete file is
+synced. `--verify` rehashes both source GGUF ranges and sidecar records. A tiny
+synthetic GGUF regression covers planning, building, complete-file recovery,
+verification, and corruption detection.
+
+For the previously available DeepSeek file the planner found 43 layers, 11,008
+experts, 77,913,391,104 payload bytes, and a 77,914,804,224-byte sidecar. That
+model is no longer present on this filesystem, and the GLM symlink is currently
+dangling, so no 78+ GB sidecar has been written. Re-run `--plan`, verify at least
+a 15–20% post-build storage margin, then run `--build` and `--verify` when a
+source model is restored.
 
 Implement an offline tool that copies exact expert tensor bytes into an
 O_DIRECT-friendly sidecar:
@@ -719,9 +729,10 @@ commit. Their performance attribution and rollback paths must remain separate.
 The corrected passive-peer profile remains the release path at 4.25 steady
 t/s, Phase 3 runtime policy is skipped, and Phase 4 owner compute is a measured
 end-to-end no-go despite its isolated kernel win. Phase 5 is therefore skipped.
-The next eligible task is **Phase 6, expert-oriented disk layout**, starting with
-format/tool design and available-space validation before writing an 80+ GiB
-sidecar. GLM fixture validation remains queued until the model is restored.
+The next eligible task is **Phase 6.1 full-size sidecar construction and
+verification** once a source model is restored, followed by Phase 6.2 read
+coalescing behind normal-GGUF fallback. GLM fixture validation remains queued
+until the model is restored.
 
 Do not start peer-owner kernels yet. Capture representative decode traces with
 the new opt-in format, then build the offline simulator before changing cache
