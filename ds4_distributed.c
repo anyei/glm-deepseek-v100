@@ -507,19 +507,69 @@ typedef struct {
  * Small Utilities And Forward Declarations
  * ========================================================================= */
 
-static uint32_t dist_prefill_send_depth(uint32_t chunk_count) {
-    uint32_t depth = 2;
-    const char *env = getenv("DS4_DIST_PREFILL_SEND_DEPTH");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 8) {
-            depth = (uint32_t)v;
-        }
+static bool dist_parse_bounded_u32(
+        const char *s,
+        const char *name,
+        uint32_t min,
+        uint32_t max,
+        uint32_t *out,
+        char *err,
+        size_t errlen) {
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "%s requires an integer", name);
+        return false;
     }
+
+    uint32_t value = 0;
+    if (s[0] == '\0') goto invalid;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (*p < '0' || *p > '9') goto invalid;
+        const uint32_t digit = (uint32_t)(*p - '0');
+        if (value > (UINT32_MAX - digit) / 10u) goto invalid;
+        value = value * 10u + digit;
+    }
+    if (value < min || value > max) goto invalid;
+
+    *out = value;
+    return true;
+
+invalid:
+    if (errlen) snprintf(err, errlen, "invalid value for %s: %s", name, s);
+    return false;
+}
+
+static bool dist_parse_positive_u32(
+        const char *s,
+        const char *name,
+        uint32_t *out,
+        char *err,
+        size_t errlen) {
+    if (!s || !out) {
+        if (errlen) snprintf(err, errlen, "%s requires a positive integer", name);
+        return false;
+    }
+    return dist_parse_bounded_u32(s, name, 1u, UINT32_MAX,
+                                  out, err, errlen);
+}
+
+static uint32_t dist_env_bounded_u32(
+        const char *name,
+        uint32_t fallback,
+        uint32_t min,
+        uint32_t max) {
+    uint32_t value = 0;
+    if (!dist_parse_bounded_u32(getenv(name), name, min, max,
+                                &value, NULL, 0)) {
+        return fallback;
+    }
+    return value;
+}
+
+static uint32_t dist_prefill_send_depth(uint32_t chunk_count) {
+    uint32_t depth = dist_env_bounded_u32(
+            "DS4_DIST_PREFILL_SEND_DEPTH", 2u, 1u, 8u);
     if (chunk_count != 0 && depth > chunk_count) depth = chunk_count;
-    return depth ? depth : 1;
+    return depth;
 }
 
 static int dist_send_work_frame(
@@ -750,45 +800,19 @@ static bool dist_u64_mul(uint64_t a, uint64_t b, uint64_t *out) {
  * ========================================================================= */
 
 static int dist_socket_buffer_bytes(void) {
-    int mb = 128;
-    const char *env = getenv("DS4_DIST_SOCKET_BUFFER_MB");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 0 && v <= 512) {
-            mb = (int)v;
-        }
-    }
-    return mb > 0 ? mb * 1024 * 1024 : 0;
+    const uint32_t mb = dist_env_bounded_u32(
+            "DS4_DIST_SOCKET_BUFFER_MB", 128u, 0u, 512u);
+    return mb > 0 ? (int)(mb * 1024u * 1024u) : 0;
 }
 
 static uint32_t dist_worker_prefetch_depth(void) {
-    uint32_t depth = 2;
-    const char *env = getenv("DS4_DIST_WORKER_PREFETCH_DEPTH");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 8) {
-            depth = (uint32_t)v;
-        }
-    }
-    return depth;
+    return dist_env_bounded_u32(
+            "DS4_DIST_WORKER_PREFETCH_DEPTH", 2u, 1u, 8u);
 }
 
 static uint32_t dist_worker_forward_window(void) {
-    uint32_t depth = 4;
-    const char *env = getenv("DS4_DIST_WORKER_FORWARD_WINDOW");
-    if (env && env[0]) {
-        errno = 0;
-        char *end = NULL;
-        long v = strtol(env, &end, 10);
-        if (errno == 0 && end != env && *end == '\0' && v >= 1 && v <= 64) {
-            depth = (uint32_t)v;
-        }
-    }
-    return depth;
+    return dist_env_bounded_u32(
+            "DS4_DIST_WORKER_FORWARD_WINDOW", 4u, 1u, 64u);
 }
 
 static bool dist_decode_profile_enabled(void) {
@@ -797,27 +821,6 @@ static bool dist_decode_profile_enabled(void) {
         enabled = getenv("DS4_DIST_DECODE_PROFILE") != NULL;
     }
     return enabled != 0;
-}
-
-static bool dist_parse_positive_u32(
-        const char *s,
-        const char *name,
-        uint32_t *out,
-        char *err,
-        size_t errlen) {
-    if (!s || !out) {
-        if (errlen) snprintf(err, errlen, "%s requires a positive integer", name);
-        return false;
-    }
-    errno = 0;
-    char *end = NULL;
-    unsigned long v = strtoul(s, &end, 10);
-    if (errno != 0 || s[0] == '\0' || *end != '\0' || v == 0 || v > UINT32_MAX) {
-        if (errlen) snprintf(err, errlen, "invalid value for %s: %s", name, s);
-        return false;
-    }
-    *out = (uint32_t)v;
-    return true;
 }
 
 /* =========================================================================
@@ -1074,16 +1077,10 @@ static int dist_set_socket_low_latency(int fd) {
     int one = 1;
     int rc = 0;
     int buffer_bytes = dist_socket_buffer_bytes();
-    int send_timeout_sec = 60;
-    const char *timeout_env = getenv("DS4_DIST_SOCKET_TIMEOUT_SEC");
-    if (timeout_env && timeout_env[0]) {
-        char *end = NULL;
-        long v = strtol(timeout_env, &end, 10);
-        if (end != timeout_env && *end == '\0' && v > 0 && v <= 3600)
-            send_timeout_sec = (int)v;
-    }
+    const uint32_t send_timeout_sec = dist_env_bounded_u32(
+            "DS4_DIST_SOCKET_TIMEOUT_SEC", 60u, 1u, 3600u);
     struct timeval send_tv = {
-        .tv_sec = send_timeout_sec,
+        .tv_sec = (time_t)send_timeout_sec,
         .tv_usec = 0,
     };
     if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) rc = -1;
@@ -1092,18 +1089,15 @@ static int dist_set_socket_low_latency(int fd) {
     /* Do not install a receive timeout by default.  Worker control sockets can
      * be legitimately idle while a KV snapshot is transferred on a separate
      * data connection; timing out that read drops an otherwise healthy route. */
-    const char *recv_timeout_env = getenv("DS4_DIST_SOCKET_RECV_TIMEOUT_SEC");
-    if (recv_timeout_env && recv_timeout_env[0]) {
-        char *end = NULL;
-        long v = strtol(recv_timeout_env, &end, 10);
-        if (end != recv_timeout_env && *end == '\0' && v > 0 && v <= 3600) {
-            struct timeval recv_tv = {
-                .tv_sec = (int)v,
-                .tv_usec = 0,
-            };
-            if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
-                           &recv_tv, sizeof(recv_tv)) != 0) rc = -1;
-        }
+    const uint32_t recv_timeout_sec = dist_env_bounded_u32(
+            "DS4_DIST_SOCKET_RECV_TIMEOUT_SEC", 0u, 1u, 3600u);
+    if (recv_timeout_sec != 0) {
+        struct timeval recv_tv = {
+            .tv_sec = (time_t)recv_timeout_sec,
+            .tv_usec = 0,
+        };
+        if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                       &recv_tv, sizeof(recv_tv)) != 0) rc = -1;
     }
     if (buffer_bytes > 0 &&
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer_bytes, sizeof(buffer_bytes)) != 0) rc = -1;
@@ -1292,25 +1286,17 @@ static bool dist_ipc_enabled(void) {
 }
 
 static uint32_t dist_ipc_slot_count_config(void) {
-    const char *s = getenv("DS4_DIST_IPC_SLOTS");
-    uint32_t v = 4;
-    if (s && !dist_parse_positive_u32(s, "DS4_DIST_IPC_SLOTS",
-                                      &v, NULL, 0)) {
-        v = 4;
-    }
-    if (v > DS4_DIST_IPC_MAX_SLOTS) v = DS4_DIST_IPC_MAX_SLOTS;
-    return v;
+    uint32_t slots = dist_env_bounded_u32(
+            "DS4_DIST_IPC_SLOTS", 4u, 1u, UINT32_MAX);
+    if (slots > DS4_DIST_IPC_MAX_SLOTS) slots = DS4_DIST_IPC_MAX_SLOTS;
+    return slots;
 }
 
 static uint64_t dist_ipc_slot_bytes_config(void) {
-    const char *s = getenv("DS4_DIST_IPC_SLOT_BYTES");
-    uint32_t v = 1048576;
-    if (s && !dist_parse_positive_u32(s, "DS4_DIST_IPC_SLOT_BYTES",
-                                      &v, NULL, 0)) {
-        v = 1048576;
-    }
-    if (v < 65536) v = 65536;
-    return v;
+    uint32_t bytes = dist_env_bounded_u32(
+            "DS4_DIST_IPC_SLOT_BYTES", 1048576u, 1u, UINT32_MAX);
+    if (bytes < 65536u) bytes = 65536u;
+    return bytes;
 }
 
 /* Process-global receive inbox, created lazily on first advertisement. */
@@ -8571,12 +8557,8 @@ static bool dist_parse_u32_component(const char *p, size_t len, uint32_t *out) {
     memcpy(buf, p, len);
     buf[len] = '\0';
 
-    errno = 0;
-    char *end = NULL;
-    unsigned long v = strtoul(buf, &end, 10);
-    if (errno != 0 || end == buf || *end != '\0' || v > UINT32_MAX) return false;
-    *out = (uint32_t)v;
-    return true;
+    return dist_parse_bounded_u32(buf, "layer", 0u, UINT32_MAX,
+                                  out, NULL, 0);
 }
 
 static bool dist_parse_layers(const char *s, ds4_distributed_layers *out, char *err, size_t errlen) {
@@ -8640,14 +8622,12 @@ static bool dist_cli_parse_port(const char *s, const char *arg, int *out, char *
         if (errlen) snprintf(err, errlen, "%s requires a TCP port", arg);
         return false;
     }
-    errno = 0;
-    char *end = NULL;
-    long v = strtol(s, &end, 10);
-    if (errno != 0 || s[0] == '\0' || *end != '\0' || v <= 0 || v > 65535) {
-        if (errlen) snprintf(err, errlen, "invalid value for %s: %s", arg, s);
+    uint32_t port = 0;
+    if (!dist_parse_bounded_u32(s, arg, 1u, 65535u,
+                                &port, err, errlen)) {
         return false;
     }
-    *out = (int)v;
+    *out = (int)port;
     return true;
 }
 

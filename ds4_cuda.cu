@@ -546,31 +546,44 @@ static void cuda_q8_f16_cache_release_all(void) {
     g_q8_f16_bytes = 0;
 }
 
-static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+static int cuda_parse_bounded_u64_env(
+        const char *name,
+        uint64_t min,
+        uint64_t max,
+        uint64_t *out) {
     const char *env = getenv(name);
-    if (present) *present = 0;
-    if (!env || !env[0]) return 0;
-    char *end = NULL;
-    unsigned long long v = strtoull(env, &end, 10);
-    if (end == env || *end != '\0') return 0;
-    if (present) *present = 1;
-    if (v > UINT64_MAX / 1048576ull) return UINT64_MAX;
-    return (uint64_t)v * 1048576ull;
+    if (!env || !env[0] || !out) return 0;
+
+    uint64_t value = 0;
+    for (const unsigned char *p = (const unsigned char *)env; *p; p++) {
+        if (*p < '0' || *p > '9') return 0;
+        const uint64_t digit = (uint64_t)(*p - '0');
+        if (value > max / 10u ||
+            (value == max / 10u && digit > max % 10u)) {
+            return 0;
+        }
+        value = value * 10u + digit;
+    }
+    if (value < min) return 0;
+    *out = value;
+    return 1;
 }
 
-/* Parse a gibibyte budget env var ("<name>=<N>"): returns N clamped to
- * [0,1024], or 0 when unset/blank/malformed. Shared by the opt-in host-L2 and
- * peer expert-cache tiers, whose GB parsers were byte-identical. */
+static uint64_t cuda_parse_mib_env(const char *name, int *present) {
+    uint64_t mib = 0;
+    const int valid = cuda_parse_bounded_u64_env(
+            name, 0, UINT64_MAX / 1048576ull, &mib);
+    if (present) *present = valid;
+    return valid ? mib * 1048576ull : 0;
+}
+
+/* Parse a gibibyte budget env var ("<name>=<N>"): accepts [0,1024], or
+ * returns 0 when unset, blank, malformed, or out of range. Shared by the
+ * opt-in host-L2 and peer expert-cache tiers. */
 static uint64_t cuda_parse_gb_env(const char *name) {
-    const char *env = getenv(name);
-    if (!env || !env[0]) return 0;
-    char *end = NULL;
-    errno = 0;
-    unsigned long long v = strtoull(env, &end, 10);
-    if (end != env && *end == '\0' && errno == 0 && v <= 1024) {
-        return (uint64_t)v;
-    }
-    return 0;
+    uint64_t gb = 0;
+    (void)cuda_parse_bounded_u64_env(name, 0, 1024, &gb);
+    return gb;
 }
 
 static uint64_t cuda_q8_f16_cache_limit_bytes(void) {
@@ -1023,12 +1036,8 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
 
 static uint64_t cuda_model_copy_chunk_bytes(void) {
     uint64_t mb = 64;
-    const char *env = getenv("DS4_CUDA_MODEL_COPY_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_MODEL_COPY_CHUNK_MB", 1, UINT64_MAX, &mb);
     if (mb < 16) mb = 16;
     if (mb > 4096) mb = 4096;
     return mb * 1048576ull;
@@ -1178,9 +1187,9 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
     if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env) gb = (uint64_t)v;
+        (void)cuda_parse_bounded_u64_env(
+                "DS4_CUDA_WEIGHT_CACHE_LIMIT_GB", 0,
+                UINT64_MAX / 1073741824ull, &gb);
         return gb * 1073741824ull;
     }
     /* One Spark can run the IQ2 model (~81 GiB) and the mixed q2/q4 model
@@ -1205,12 +1214,8 @@ static int cuda_model_cache_limit_explicit(void) {
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
     uint64_t mb = 1792;
-    const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
-    if (env && env[0]) {
-        char *end = NULL;
-        unsigned long long v = strtoull(env, &end, 10);
-        if (end != env && v > 0) mb = (uint64_t)v;
-    }
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_WEIGHT_ARENA_CHUNK_MB", 1, UINT64_MAX, &mb);
     if (mb < 256) mb = 256;
     if (mb > 8192) mb = 8192;
     uint64_t bytes = mb * 1048576ull;
@@ -1564,16 +1569,12 @@ static void cuda_stream_expert_cache_invalidate(void) {
 static uint32_t cuda_stream_expert_cache_requested_budget(void) {
     uint32_t cap = g_stream_expert_budget_override != 0 ?
         g_stream_expert_budget_override : DS4_CUDA_STREAM_EXPERT_DEFAULT;
-    const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_N");
-    if (env && env[0]) {
-        char *end = NULL;
-        errno = 0;
-        unsigned long v = strtoul(env, &end, 10);
-        while (end && (*end == ' ' || *end == '\t')) end++;
-        if (end != env && errno == 0 && end && *end == '\0') {
-            cap = v > DS4_CUDA_STREAM_EXPERT_MAX ?
-                DS4_CUDA_STREAM_EXPERT_MAX : (uint32_t)v;
-        }
+    uint64_t requested = 0;
+    if (cuda_parse_bounded_u64_env(
+            "DS4_CUDA_STREAMING_EXPERT_CACHE_N", 0, UINT64_MAX,
+            &requested)) {
+        cap = requested > DS4_CUDA_STREAM_EXPERT_MAX ?
+            DS4_CUDA_STREAM_EXPERT_MAX : (uint32_t)requested;
     }
     if (cap > DS4_CUDA_STREAM_EXPERT_MAX) {
         cap = DS4_CUDA_STREAM_EXPERT_MAX;
@@ -1603,16 +1604,9 @@ static int cuda_stream_expert_cache_budget_visible_to_shared(void) {
 
 static uint64_t cuda_stream_expert_cache_reserve_bytes(void) {
     uint64_t gb = 16;
-    const char *env = getenv("DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB");
-    if (env && env[0]) {
-        char *end = NULL;
-        errno = 0;
-        unsigned long long v = strtoull(env, &end, 10);
-        while (end && (*end == ' ' || *end == '\t')) end++;
-        if (end != env && errno == 0 && end && *end == '\0') {
-            gb = (uint64_t)v;
-        }
-    }
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_STREAMING_EXPERT_CACHE_RESERVE_GB", 0,
+            UINT64_MAX, &gb);
     if (gb > UINT64_MAX / 1073741824ull) return UINT64_MAX;
     return gb * 1073741824ull;
 }
@@ -1816,15 +1810,12 @@ static uint32_t cuda_stream_expert_peer_budget_experts(
         return 0;
     }
     int peer = g_cuda_device == 0 ? 1 : 0;
-    const char *penv = getenv("DS4_CUDA_PEER_DEVICE");
-    if (penv && penv[0]) {
-        char *end = NULL;
-        errno = 0;
-        long v = strtol(penv, &end, 10);
-        if (end != penv && *end == '\0' && errno == 0 &&
-            v >= 0 && v < ndev && (int)v != g_cuda_device) {
-            peer = (int)v;
-        }
+    uint64_t requested_peer = 0;
+    if (cuda_parse_bounded_u64_env(
+            "DS4_CUDA_PEER_DEVICE", 0, INT_MAX, &requested_peer) &&
+        requested_peer < (uint64_t)ndev &&
+        (int)requested_peer != g_cuda_device) {
+        peer = (int)requested_peer;
     }
 
     int fwd = 0, rev = 0;
@@ -2034,16 +2025,10 @@ static cudaStream_t g_stream_read_upload_stream;
 static uint32_t cuda_stream_read_thread_count(void) {
     static int cached = -1;
     if (cached >= 0) return (uint32_t)cached;
-    long n = 8;
-    const char *env = getenv("DS4_CUDA_STREAM_READ_THREADS");
-    if (env && env[0]) {
-        char *end = NULL;
-        errno = 0;
-        long v = strtol(env, &end, 10);
-        if (end != env && *end == '\0' && errno == 0 && v >= 0 && v <= 64) {
-            n = v;
-        }
-    }
+    uint64_t requested = 8;
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_STREAM_READ_THREADS", 0, 64, &requested);
+    long n = (long)requested;
     const long hw = (long)std::thread::hardware_concurrency();
     if (hw > 2 && n > hw - 2) n = hw - 2;
     if (n < 0) n = 0;
@@ -3168,15 +3153,13 @@ extern "C" int ds4_gpu_init(void) {
      * device is selected here instead of via CUDA_VISIBLE_DEVICES. */
     const char *dev_env = getenv("DS4_CUDA_DEVICE");
     if (dev_env && *dev_env) {
-        char *end = NULL;
-        errno = 0;
-        long v = strtol(dev_env, &end, 10);
-        if (end == dev_env || *end != '\0' || errno != 0 ||
-            v < 0 || v > INT_MAX) {
+        uint64_t requested = 0;
+        if (!cuda_parse_bounded_u64_env(
+                "DS4_CUDA_DEVICE", 0, INT_MAX, &requested)) {
             fprintf(stderr, "ds4: invalid DS4_CUDA_DEVICE value: %s\n", dev_env);
             return 0;
         }
-        dev = (int)v;
+        dev = (int)requested;
     }
     if (!cuda_ok(cudaSetDevice(dev), "set device")) return 0;
     g_cuda_device = dev;
@@ -3995,14 +3978,9 @@ static int cuda_expert_trace_enabled(void) {
     const char *path = getenv("DS4_CUDA_EXPERT_TRACE");
     if (!path || !path[0]) return 0;
     g_expert_trace.max_rows = 1000000;
-    const char *limit = getenv("DS4_CUDA_EXPERT_TRACE_MAX_ROWS");
-    if (limit && limit[0]) {
-        char *end = NULL;
-        unsigned long long value = strtoull(limit, &end, 10);
-        if (end != limit && end && *end == '\0' && value != 0) {
-            g_expert_trace.max_rows = (uint64_t)value;
-        }
-    }
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_EXPERT_TRACE_MAX_ROWS", 1, UINT64_MAX,
+            &g_expert_trace.max_rows);
     g_expert_trace.file = fopen(path, "wb");
     if (!g_expert_trace.file) {
         fprintf(stderr, "ds4: cannot open CUDA expert trace %s: %s\n",
@@ -10828,13 +10806,12 @@ extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
     if (!out_a || !out_b) return 0;
 
     const __half *out_a_f16 = NULL;
-    uint32_t out_a_cublas_min_tokens = 2u;
-    const char *out_a_min_env = getenv("DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN");
-    if (out_a_min_env && out_a_min_env[0]) {
-        char *endp = NULL;
-        long v = strtol(out_a_min_env, &endp, 10);
-        if (endp != out_a_min_env && v > 1 && v < 4096) out_a_cublas_min_tokens = (uint32_t)v;
-    }
+    uint64_t out_a_cublas_min_tokens_env = 2;
+    (void)cuda_parse_bounded_u64_env(
+            "DS4_CUDA_ATTENTION_OUTPUT_A_CUBLAS_MIN", 2, 4095,
+            &out_a_cublas_min_tokens_env);
+    const uint32_t out_a_cublas_min_tokens =
+            (uint32_t)out_a_cublas_min_tokens_env;
     if (!g_quality_mode &&
         g_cublas_ready &&
         n_tokens >= out_a_cublas_min_tokens &&

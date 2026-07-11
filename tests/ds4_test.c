@@ -2189,6 +2189,67 @@ static void test_mtp_verify_depth(void) {
 }
 #endif
 
+static ds4_dist_cli_parse_result test_dist_parse_value(
+        const char *arg,
+        const char *value) {
+    ds4_dist_options *opt = ds4_dist_options_create();
+    TEST_ASSERT(opt != NULL);
+    if (!opt) return DS4_DIST_CLI_ERROR;
+
+    char *argv[] = {"ds4", (char *)arg, (char *)value};
+    int index = 1;
+    char err[160] = {0};
+    ds4_dist_cli_parse_result result = ds4_dist_parse_cli_arg(
+            argv[index], &index, 3, argv, opt, err, sizeof(err));
+    ds4_dist_options_free(opt);
+    return result;
+}
+
+static ds4_dist_cli_parse_result test_dist_parse_listen_port(
+        const char *port) {
+    ds4_dist_options *opt = ds4_dist_options_create();
+    TEST_ASSERT(opt != NULL);
+    if (!opt) return DS4_DIST_CLI_ERROR;
+
+    char *argv[] = {"ds4", "--listen", "127.0.0.1", (char *)port};
+    int index = 1;
+    char err[160] = {0};
+    ds4_dist_cli_parse_result result = ds4_dist_parse_cli_arg(
+            argv[index], &index, 4, argv, opt, err, sizeof(err));
+    ds4_dist_options_free(opt);
+    return result;
+}
+
+static void test_distributed_config_parsing(void) {
+    static const char *valid_positive[] = {
+        "1", "0001", "4294967295",
+    };
+    static const char *invalid_positive[] = {
+        "", "0", "-1", "+1", " 1", "1 ", "1x", "4294967296",
+    };
+    for (size_t i = 0; i < sizeof(valid_positive) / sizeof(valid_positive[0]); i++) {
+        TEST_ASSERT(test_dist_parse_value("--dist-prefill-chunk", valid_positive[i]) ==
+                    DS4_DIST_CLI_MATCHED);
+    }
+    for (size_t i = 0; i < sizeof(invalid_positive) / sizeof(invalid_positive[0]); i++) {
+        TEST_ASSERT(test_dist_parse_value("--dist-prefill-chunk", invalid_positive[i]) ==
+                    DS4_DIST_CLI_ERROR);
+    }
+
+    TEST_ASSERT(test_dist_parse_value("--layers", "0:1") == DS4_DIST_CLI_MATCHED);
+    TEST_ASSERT(test_dist_parse_value("--layers", "0:output") == DS4_DIST_CLI_MATCHED);
+    TEST_ASSERT(test_dist_parse_value("--layers", " 0:1") == DS4_DIST_CLI_ERROR);
+    TEST_ASSERT(test_dist_parse_value("--layers", "+0:1") == DS4_DIST_CLI_ERROR);
+    TEST_ASSERT(test_dist_parse_value("--layers", "0:1 ") == DS4_DIST_CLI_ERROR);
+
+    TEST_ASSERT(test_dist_parse_listen_port("1") == DS4_DIST_CLI_MATCHED);
+    TEST_ASSERT(test_dist_parse_listen_port("65535") == DS4_DIST_CLI_MATCHED);
+    TEST_ASSERT(test_dist_parse_listen_port("0") == DS4_DIST_CLI_ERROR);
+    TEST_ASSERT(test_dist_parse_listen_port("65536") == DS4_DIST_CLI_ERROR);
+    TEST_ASSERT(test_dist_parse_listen_port("+1") == DS4_DIST_CLI_ERROR);
+    TEST_ASSERT(test_dist_parse_listen_port(" 1") == DS4_DIST_CLI_ERROR);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -2216,6 +2277,7 @@ static const ds4_test_entry test_entries[] = {
     {"--streaming-decode-prefill-correctness", "streaming-decode-prefill-correctness", "streaming decode-style cold prefill drift and repeatability", test_streaming_decode_prefill_correctness},
     {"--mtp-verify-depth", "mtp-verify-depth", "MTP speculative verify commits autoregressive-identical tokens at draft depth > 2", test_mtp_verify_depth},
 #endif
+    {"--distributed-config", "distributed-config", "distributed integer configuration parsing", test_distributed_config_parsing},
     {"--server", "server", "server parser/rendering/cache unit tests", test_server_unit_group},
 };
 

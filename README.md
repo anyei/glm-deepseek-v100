@@ -36,6 +36,7 @@ and for quality and speed testing.
 > section says otherwise.
 
 We support the following backends:
+
 * **NVIDIA V100 (Volta, sm_70)** is this fork's primary target: 32 GB V100s (one or two, NVLink-connected) with the models streamed from NVMe. Build with `make cuda CUDA_ARCH=sm_70` inside a CUDA 12.9 container, or use the provided Dockerfile (see [RUNNING.md](RUNNING.md)).
 * **Metal** is upstream's primary target. Starting from MacBooks with 96GB of RAM (or less, using SSD streaming).
 * **NVIDIA CUDA / DGX Spark**, CUDA with special care for the DGX Spark.
@@ -98,41 +99,41 @@ If you are looking for very specific things, we have other
 sub-README files. Otherwise for normal usage keep reading the
 next sections.
 
-- [DEVELOPMENT.md](DEVELOPMENT.md): the fork's dev workflow — branch, build
+* [DEVELOPMENT.md](DEVELOPMENT.md): the fork's dev workflow — branch, build
   (`sm_70` in the CUDA 12.9 container), the change-type→validation-tier table,
   the fast-equivalence A/B recipe, and the merge discipline.
-- [ROADMAP.md](ROADMAP.md): the fork's prioritized "what next" — the ops
+* [ROADMAP.md](ROADMAP.md): the fork's prioritized "what next" — the ops
   items to make the merge deployable and the performance-phase levers.
   VOLTA.md/VALIDATION.md are its detailed backlog.
-- [V100_ARCHITECTURE_ANALYSIS.md](V100_ARCHITECTURE_ANALYSIS.md): hardware-
+* [V100_ARCHITECTURE_ANALYSIS.md](V100_ARCHITECTURE_ANALYSIS.md): hardware-
   specific analysis of the best streaming architecture for this two-V100 host,
   including the case for exclusive expert ownership and owner-side MoE compute.
-- [V100_IMPLEMENTATION_PLAN.md](V100_IMPLEMENTATION_PLAN.md): the gated,
+* [V100_IMPLEMENTATION_PLAN.md](V100_IMPLEMENTATION_PLAN.md): the gated,
   benchmark-first implementation sequence derived from that analysis.
-- [VOLTA.md](VOLTA.md): this fork's V100/Volta notes — the GLM 5.2 CUDA
+* [VOLTA.md](VOLTA.md): this fork's V100/Volta notes — the GLM 5.2 CUDA
   port, the FP16 tensor-core GEMM path, streaming expert-cache tiers, and
   the NVLink GPU IPC transport, with measured numbers.
-- [RUNNING.md](RUNNING.md): how to build and run the `sm_70` Docker image,
+* [RUNNING.md](RUNNING.md): how to build and run the `sm_70` Docker image,
   single-GPU and two-GPU (docker compose) setups, and the fork's
   environment variables.
-- [VALIDATION.md](VALIDATION.md): the validation playbook and QA logs,
+* [VALIDATION.md](VALIDATION.md): the validation playbook and QA logs,
   including the GLM-on-CUDA release gate (§8) and the standing
   soak + fixture + binary-A/B recipe for runtime changes (§9).
-- [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
+* [CONTRIBUTING.md](CONTRIBUTING.md): correctness and speed regression testing
   guide for contributors. **Read this before sending a pull request**.
-- [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
+* [gguf-tools/README.md](gguf-tools/README.md): offline GGUF generation,
   imatrix collection, quantization tooling, and quality checks.
-- [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
+* [gguf-tools/imatrix/README.md](gguf-tools/imatrix/README.md): how the
   routed-MoE imatrix is collected and used.
-- [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
+* [gguf-tools/imatrix/dataset/README.md](gguf-tools/imatrix/dataset/README.md):
   how the calibration prompt corpus is generated.
-- [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
+* [gguf-tools/quality-testing/README.md](gguf-tools/quality-testing/README.md):
   how local GGUFs are scored against official DeepSeek V4 Flash/PRO continuations.
-- [dir-steering/README.md](dir-steering/README.md): directional steering data,
+* [dir-steering/README.md](dir-steering/README.md): directional steering data,
   vector generation, and usage.
-- [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
+* [speed-bench/README.md](speed-bench/README.md): benchmark commands, charts,
   and CSV generation.
-- [tests/test-vectors/README.md](tests/test-vectors/README.md): official
+* [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
 
 ## Model Weights
@@ -694,7 +695,7 @@ q1..q4 token-count gate in the test plan:
 The generated-token counts must stay aligned with the baseline:
 
 | Question | Expected state | Expected generated tokens | Expected given/correct |
-|---:|---|---:|---|
+| ---: | --- | ---: | --- |
 | 1 | `PASSED` | 2048 | `B` / `B` |
 | 2 | `PASSED` | 438 | `C` / `C` |
 | 3 | `PASSED` | 666 | `70` / `70` |
@@ -716,20 +717,20 @@ rows.
 The set should be treated as a hard capability regression suite rather than
 a pass/fail unit test.
 
-- **GPQA Diamond** contributes graduate-level science questions with
+* **GPQA Diamond** contributes graduate-level science questions with
   multiple-choice answers. DeepSeek's model card reports strong results
   on full GPQA Diamond in thinking mode, but individual items still require
   careful physics, chemistry, or biology reasoning and are easy to lose with a
   small prompt/rendering or sampling regression.
-- **SuperGPQA** contributes broad specialist knowledge and domain-transfer
+* **SuperGPQA** contributes broad specialist knowledge and domain-transfer
   questions. The model-card SuperGPQA number is much lower than GPQA Diamond,
   so these items are expected to be uneven: some look mundane, others require
   niche professional knowledge or exact interpretation of a translated-style
   exam question.
-- **AIME 2025** contributes exact-answer contest math. These are often the most
+* **AIME 2025** contributes exact-answer contest math. These are often the most
   unforgiving items in the set: no multiple-choice prior, no partial credit, and
   a single arithmetic or algebraic slip changes the grade.
-- **COMPSEC** contributes single-function C/C++ security reasoning items
+* **COMPSEC** contributes single-function C/C++ security reasoning items
   reduced from public CVE writeups. These are not exploit prompts: the task is
   to identify the best source line where the defensive code flaw is introduced,
   or return `0` for a safe function.
@@ -790,13 +791,13 @@ live graph/session.
 
 Supported endpoints:
 
-- `GET /v1/models`
-- `GET /v1/models/deepseek-v4-flash`
-- `GET /v1/models/deepseek-v4-pro`
-- `POST /v1/chat/completions`
-- `POST /v1/responses`
-- `POST /v1/completions`
-- `POST /v1/messages`
+* `GET /v1/models`
+* `GET /v1/models/deepseek-v4-flash`
+* `GET /v1/models/deepseek-v4-pro`
+* `POST /v1/chat/completions`
+* `POST /v1/responses`
+* `POST /v1/completions`
+* `POST /v1/messages`
 
 The Flash and PRO model endpoints are compatibility aliases. They both report
 the model currently loaded from the GGUF passed with `-m`; the endpoint name does
@@ -1182,15 +1183,15 @@ The DS4 session payload starts with thirteen little-endian `u32` fields:
 
 Then it stores:
 
-- `u32[token_count]` checkpoint token IDs.
-- `float32[vocab_size]` logits for the next token after that checkpoint.
-- `u32[layer_count]` compressed attention row counts.
-- `u32[layer_count]` ratio-4 indexer row counts.
-- For every layer: the live raw sliding-window KV rows, written in logical
+* `u32[token_count]` checkpoint token IDs.
+* `float32[vocab_size]` logits for the next token after that checkpoint.
+* `u32[layer_count]` compressed attention row counts.
+* `u32[layer_count]` ratio-4 indexer row counts.
+* For every layer: the live raw sliding-window KV rows, written in logical
   position order rather than physical ring order.
-- For compressed layers: live compressed KV rows and compressor frontier
+* For compressed layers: live compressed KV rows and compressor frontier
   tensors.
-- For ratio-4 compressed layers: live indexer compressed rows and indexer
+* For ratio-4 compressed layers: live indexer compressed rows and indexer
   frontier tensors.
 
 The logits are raw IEEE-754 `float32` values from the host `ds4_session`
@@ -1212,10 +1213,10 @@ builds for this model layout.
 
 The cache stores checkpoints at four moments:
 
-- `cold`: after a long first prompt reaches a stable prefix, before generation.
-- `continued`: when prefill or generation reaches the next absolute aligned frontier.
-- `evict`: before an unrelated request replaces the live in-memory session.
-- `shutdown`: when the server exits cleanly.
+* `cold`: after a long first prompt reaches a stable prefix, before generation.
+* `continued`: when prefill or generation reaches the next absolute aligned frontier.
+* `evict`: before an unrelated request replaces the live in-memory session.
+* `shutdown`: when the server exits cleanly.
 
 Cold saves intentionally trim a small token suffix and align down to a prefill
 chunk boundary. This avoids common BPE boundary retokenization misses when a
@@ -1229,13 +1230,13 @@ every 10k tokens, independent of where the first cold checkpoint landed, so long
 generations leave restart points behind without persisting the fragile final few
 tokens.
 
-- `--kv-cache-min-tokens`
-- `--kv-cache-cold-max-tokens`
-- `--kv-cache-continued-interval-tokens`
-- `--kv-cache-boundary-trim-tokens`
-- `--kv-cache-boundary-align-tokens`
-- `--tool-memory-max-ids`
-- `--disable-exact-dsml-tool-replay`
+* `--kv-cache-min-tokens`
+* `--kv-cache-cold-max-tokens`
+* `--kv-cache-continued-interval-tokens`
+* `--kv-cache-boundary-trim-tokens`
+* `--kv-cache-boundary-align-tokens`
+* `--tool-memory-max-ids`
+* `--disable-exact-dsml-tool-replay`
 
 By default, checkpoints may be reused across the 2-bit and 4-bit routed-expert
 variants if the rendered prefix matches. Use `--kv-cache-reject-different-quant`
@@ -1324,8 +1325,8 @@ as well—local GPU-cache hits are cheaper than either second tier.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `DS4_DIST_NO_IPC=1` | IPC enabled when supported | Force distributed activations through TCP instead of the same-host CUDA IPC/NVLink path. Useful as an A/B or compatibility fallback. Set it on every process. |
-| `DS4_DIST_IPC_SLOTS=N` | `4` | Set the receiving CUDA IPC inbox depth. Positive integers are capped at 8; malformed and non-positive values use the default. |
-| `DS4_DIST_IPC_SLOT_BYTES=N` | `1048576` | Set bytes per IPC inbox slot. Positive values below 65536 are raised to 65536; values above `UINT32_MAX`, malformed values, and non-positive values use the default. |
+| `DS4_DIST_IPC_SLOTS=N` | `4` | Set the receiving CUDA IPC inbox depth. Positive ASCII-decimal integers are capped at 8; malformed and non-positive values use the default. |
+| `DS4_DIST_IPC_SLOT_BYTES=N` | `1048576` | Set bytes per IPC inbox slot. Positive ASCII-decimal values below 65536 are raised to 65536; values above `UINT32_MAX`, malformed values, and non-positive values use the default. |
 
 CUDA IPC requires all participating GPUs to remain visible and the processes to
 share compatible IPC/PID namespaces. The supplied [`docker-compose.yml`](docker-compose.yml)
@@ -1468,12 +1469,12 @@ first answer:
 ./ds4-server --trace /tmp/ds4-trace.txt ...
 ```
 
-- `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
+* `--dump-tokens` tokenizes the `-p` or `--prompt-file` string exactly as
   written, recognizes DS4 protocol specials, and then exits before inference
   starts. For example, the DSML tool close marker starts as two tokens: `</`
   and `｜DSML｜`.
-- `--dump-logprobs` stores a greedy continuation with the top local
+* `--dump-logprobs` stores a greedy continuation with the top local
   alternatives at each step, which helps separate sampling choices from
   logit/model issues.
-- `ds4-server --trace` writes the rendered prompts, cache decisions, generated
+* `ds4-server --trace` writes the rendered prompts, cache decisions, generated
   text, and tool-parser events for a whole agent session.

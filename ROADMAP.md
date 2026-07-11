@@ -123,11 +123,15 @@ can't just be committed blind on numerically-validated shipping code.
   (the sibling Q2_K arm already reuses the shared dot); the `dev_q{4,5,6}_K_dot_f32`
   carry an always-`nb==1` loop. "Algebraically equal" ≠ bit-identical, so these
   need the soak/fixture, not just the A/B.
-- [ ] **Consolidate env-var parsing** (behavior-adjacent — changes accepted
-  input syntax). ~11 near-duplicate `strtoul/strtoull` parse+clamp blocks with
-  inconsistent validation (some skip whitespace, the IPC pair accepts trailing
-  garbage, ad-hoc clamp ceilings). Route every knob through one bounded helper
-  per module (`cuda_parse_mib_env` / `dist_parse_positive_u32` already exist).
+- [x] **Consolidate env-var parsing** — completed 2026-07-10. All numeric CUDA
+  and distributed runtime knobs now route through one bounded parser per
+  module; distributed layer/port CLI parsing shares the same path. Inputs use
+  ASCII decimal digits only, so signs, whitespace, suffixes, overflow, and
+  out-of-range values are rejected consistently. Existing defaults and the
+  documented IPC min/max clamps remain intact. Focused boundary tests, fresh
+  CPU/CUDA `sm_70` builds, a two-V100 distributed IPC smoke, and the §9 fast
+  DeepSeek binary A/B passed; both 48-step dumps were byte-identical (SHA256
+  `95c00ee3915ebbdb7879d9c345e1d3f52069ff5d9f6bddd03f9d4c2b457df515`).
 
 The two efficiency findings below are perf, not cleanup — they belong to §2's
 hot-path work but were surfaced here:
