@@ -29,6 +29,15 @@ class Event:
     observed: dict[int, tuple[int, int]]
 
 
+def parse_int(value: str | int | float | None, context: str) -> int:
+    if value is None:
+        raise ValueError(f"missing integer for {context}")
+    try:
+        return int(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"invalid integer for {context}: {value!r}") from error
+
+
 def load_trace(path: Path) -> tuple[list[Event], dict[str, str]]:
     header: dict[str, str] = {}; lines = []
     with path.open(newline="", errors="replace") as f:
@@ -45,18 +54,36 @@ def load_trace(path: Path) -> tuple[list[Event], dict[str, str]]:
         raise ValueError(f"trace lacks columns: {sorted(required - set(reader.fieldnames or []))}")
     grouped: dict[int, list[dict[str, str]]] = defaultdict(list); expert_bytes = 0
     for row in reader:
-        grouped[int(row["call"])].append(row)
-        expert_bytes = max(expert_bytes, int(row["bytes_read"]))
+        call = parse_int(row["call"], "trace call")
+        grouped[call].append(row)
+        expert_bytes = max(
+            expert_bytes,
+            parse_int(row["bytes_read"], f"trace call {call} bytes_read"),
+        )
     if not grouped or expert_bytes == 0: raise ValueError("empty trace or no expert byte geometry")
     events = []
     for call in sorted(grouped):
         group = grouped[call]; seen: dict[int, tuple[int, int]] = {}
         for row in group:
-            expert = int(row["expert"]); old = seen.get(expert, (int(row["hit"]), 0))
-            seen[expert] = (old[0], old[1] + int(row["bytes_read"]))
-        events.append(Event(call, int(group[0]["token"]), int(group[0]["layer"]),
-                            sorted(seen), int(group[0]["cache_slots"]),
-                            int(group[0]["local_slots"]), expert_bytes, seen))
+            expert = parse_int(row["expert"], f"trace call {call} expert")
+            old = seen.get(
+                expert,
+                (parse_int(row["hit"], f"trace call {call} hit"), 0),
+            )
+            seen[expert] = (
+                old[0],
+                old[1] + parse_int(row["bytes_read"], f"trace call {call} bytes_read"),
+            )
+        events.append(Event(
+            call,
+            parse_int(group[0]["token"], f"trace call {call} token"),
+            parse_int(group[0]["layer"], f"trace call {call} layer"),
+            sorted(seen),
+            parse_int(group[0]["cache_slots"], f"trace call {call} cache_slots"),
+            parse_int(group[0]["local_slots"], f"trace call {call} local_slots"),
+            expert_bytes,
+            seen,
+        ))
     return events, header
 
 
@@ -80,7 +107,10 @@ class Simulator:
     def capacity(self, event: Event) -> int:
         cap = self.capacity_override if self.capacity_override is not None else event.capacity
         if self.policy == "decode-protected" and not self.is_decode(event):
-            cap = int(cap * self.ephemeral_fraction)
+            cap = parse_int(
+                cap * self.ephemeral_fraction,
+                "decode-protected ephemeral capacity",
+            )
         if self.policy == "topk-replication":
             cap -= sum(key in self.hot for key in self.cache)
         return max(cap, 0)
@@ -164,7 +194,9 @@ def reuse_distances(events: list[Event]) -> tuple[int, list[int]]:
 
 def percentile(values: list[int], q: float) -> int:
     if not values: return 0
-    values = sorted(values); return values[min(int((len(values) - 1) * q), len(values) - 1)]
+    values = sorted(values)
+    index = parse_int((len(values) - 1) * q, "percentile index")
+    return values[min(index, len(values) - 1)]
 
 
 def main() -> int:
@@ -178,7 +210,11 @@ def main() -> int:
     ap.add_argument("--policies", default=",".join(sorted(POLICIES)))
     args = ap.parse_args()
     if not 0 <= args.ephemeral_fraction <= 1: ap.error("--ephemeral-fraction must be in 0..1")
-    events, header = load_trace(args.trace); oh, om, ob = observed(events)
+    try:
+        events, header = load_trace(args.trace)
+    except (OSError, ValueError) as error:
+        ap.error(str(error))
+    oh, om, ob = observed(events)
     frequency = Counter((event.layer, expert) for event in events for expert in event.experts)
     hot = {key for key, _ in frequency.most_common(args.top_k)}
     first_seen: set[Key] = set(); initial_residents: list[Key] = []

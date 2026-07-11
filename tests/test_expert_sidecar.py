@@ -56,7 +56,10 @@ class ExpertSidecarTest(unittest.TestCase):
             make_model(model)
 
             plan = self.run_tool(model, "--plan")
-            summary = json.loads(plan.stdout)
+            try:
+                summary = json.loads(plan.stdout)
+            except json.JSONDecodeError as error:
+                self.fail(f"sidecar plan did not emit valid JSON: {error}")
             self.assertEqual(summary["layers"], 1)
             self.assertEqual(summary["experts"], 2)
             self.assertEqual(summary["payload_bytes"], 408)

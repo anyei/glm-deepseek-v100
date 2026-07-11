@@ -14,6 +14,8 @@ import os
 import re
 import struct
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -49,6 +51,18 @@ PART = {"gate": "gate", "up": "up", "down": "down",
 
 def align(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
+
+
+@contextmanager
+def managed_fd(path: Path, flags: int, mode: int | None = None) -> Iterator[int]:
+    try:
+        fd = os.open(path, flags) if mode is None else os.open(path, flags, mode)
+    except OSError as error:
+        raise OSError(f"cannot open {path}: {error}") from error
+    try:
+        yield fd
+    finally:
+        os.close(fd)
 
 
 class Reader:
@@ -140,7 +154,9 @@ def parse_gguf(path: Path):
             kind = reader.u32()
             value = reader.value(kind, key == "general.alignment")
             if key == "general.alignment":
-                alignment = int(value)
+                if not isinstance(value, int):
+                    raise ValueError("general.alignment metadata is not an integer")
+                alignment = value
         if alignment <= 0 or alignment & (alignment - 1):
             raise ValueError(f"invalid GGUF alignment {alignment}")
 
@@ -179,7 +195,10 @@ def routed_tensors(tensors: list[Tensor]):
                 break
         if not match:
             continue
-        layer = int(match.group(1))
+        try:
+            layer = int(match.group(1))
+        except ValueError as error:
+            raise ValueError(f"invalid routed tensor layer: {tensor.name}") from error
         part = PART[match.group(2)]
         if len(tensor.dims) != 3:
             raise ValueError(f"routed tensor is not 3D: {tensor.name}")
@@ -352,9 +371,8 @@ def build(model: Path, output: Path, records: list[Record], alignment: int,
         flags |= os.O_EXCL
     model_stat = model.stat()
     model_identity = (model_stat.st_size, model_stat.st_mtime_ns)
-    sidecar_fd = os.open(temporary, flags, 0o644)
-    model_fd = os.open(model, os.O_RDONLY)
-    try:
+    with managed_fd(temporary, flags, 0o644) as sidecar_fd, \
+            managed_fd(model, os.O_RDONLY) as model_fd:
         if os.fstat(sidecar_fd).st_size == 0:
             free_bytes = os.statvfs(temporary.parent).f_bavail * os.statvfs(temporary.parent).f_frsize
             if free_bytes < total_size:
@@ -406,19 +424,16 @@ def build(model: Path, output: Path, records: list[Record], alignment: int,
                                     total_size, True, directory_digest)
         pwrite_all(sidecar_fd, final_header, 0)
         os.fsync(sidecar_fd)
-    finally:
-        os.close(model_fd)
-        os.close(sidecar_fd)
 
     # A hard link publishes the synced inode atomically without replacing a file
     # that raced the initial existence check.
     os.link(temporary, output)
-    os.unlink(temporary)
-    directory_fd = os.open(output.parent, os.O_RDONLY)
     try:
+        os.unlink(temporary)
+    except OSError as error:
+        raise OSError(f"cannot remove published temporary sidecar {temporary}: {error}") from error
+    with managed_fd(output.parent, os.O_RDONLY) as directory_fd:
         os.fsync(directory_fd)
-    finally:
-        os.close(directory_fd)
 
 
 def verify(model: Path, sidecar: Path, records: list[Record],
@@ -437,9 +452,8 @@ def verify(model: Path, sidecar: Path, records: list[Record],
         if hashlib.sha256(directory).digest() != header["directory_sha256"]:
             raise ValueError("sidecar directory checksum mismatch")
 
-        model_fd = os.open(model, os.O_RDONLY)
-        sidecar_fd = os.open(sidecar, os.O_RDONLY)
-        try:
+        with managed_fd(model, os.O_RDONLY) as model_fd, \
+                managed_fd(sidecar, os.O_RDONLY) as sidecar_fd:
             for index, record in enumerate(records):
                 values = ENTRY_FORMAT.unpack_from(directory, index * ENTRY_BYTES)
                 record.digest = values[10]
@@ -458,9 +472,6 @@ def verify(model: Path, sidecar: Path, records: list[Record],
                     destination += size
                 if source_hash.digest() != record.digest or sidecar_hash.digest() != record.digest:
                     raise ValueError(f"expert payload checksum mismatch at record {index}")
-        finally:
-            os.close(model_fd)
-            os.close(sidecar_fd)
 
 
 def summary(model: Path, version: int, gguf_alignment: int, data_offset: int,

@@ -1,7 +1,7 @@
 # Best-Case Architecture Analysis for the Two-V100 Host
 
-Status: design analysis, not an implementation claim.  
-Hardware snapshot: 2026-07-10.  
+Status: design analysis, not an implementation claim.
+Hardware snapshot: 2026-07-10.
 Primary objective: maximize sustained interactive decode for DeepSeek V4 Flash
 and GLM 5.2 without weakening numerical validation, while retaining useful
 prefill and CPU-only reference paths.

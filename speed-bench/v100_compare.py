@@ -7,6 +7,7 @@ import argparse
 import re
 import statistics
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +62,24 @@ class Result:
     resources: list[RunResources]
 
 
+def parse_int(value: str, context: str) -> int:
+    try:
+        return int(value)
+    except ValueError as error:
+        raise ValueError(f"invalid integer for {context}: {value!r}") from error
+
+
+def parse_float(value: str, context: str) -> float:
+    try:
+        return float(value)
+    except ValueError as error:
+        raise ValueError(f"invalid number for {context}: {value!r}") from error
+
+
+def run_index(path: Path) -> int:
+    return parse_int(path.name.split("-", 1)[1], f"run directory {path.name}")
+
+
 def metadata(path: Path) -> dict[str, str]:
     out: dict[str, str] = {}
     meta = path / "metadata.txt"
@@ -77,11 +96,24 @@ def metadata(path: Path) -> dict[str, str]:
 def disk_sectors(path: Path, maj_min: str) -> int | None:
     if not path.exists() or ":" not in maj_min:
         return None
-    major, minor = (int(part) for part in maj_min.split(":", 1))
+    try:
+        major_text, minor_text = maj_min.split(":", 1)
+        major = parse_int(major_text, "model device major")
+        minor = parse_int(minor_text, "model device minor")
+    except ValueError:
+        return None
     for line in path.read_text(errors="replace").splitlines():
         fields = line.split()
-        if len(fields) >= 6 and int(fields[0]) == major and int(fields[1]) == minor:
-            return int(fields[5])
+        if len(fields) < 6:
+            continue
+        try:
+            line_major = parse_int(fields[0], "diskstats major")
+            line_minor = parse_int(fields[1], "diskstats minor")
+            sectors = parse_int(fields[5], "diskstats sectors")
+        except ValueError:
+            continue
+        if line_major == major and line_minor == minor:
+            return sectors
     return None
 
 
@@ -89,11 +121,15 @@ def run_resources(run_dir: Path, log_text: str, meta: dict[str, str]) -> RunReso
     configured = CACHE_RE.search(log_text)
     capped = CACHE_CAP_RE.findall(log_text)
     allocated = CACHE_ALLOC_RE.findall(log_text)
-    local_slots = int(allocated[-1][0]) if allocated else (
-        int(capped[-1]) if capped else (int(configured.group(1)) if configured else None)
+    local_slots = parse_int(allocated[-1][0], "allocated local slots") if allocated else (
+        parse_int(capped[-1], "capped local slots") if capped else (
+            parse_int(configured.group(1), "configured local slots") if configured else None
+        )
     )
     peer = PEER_CACHE_RE.search(log_text)
-    allocated_peer = int(allocated[-1][1]) if allocated else None
+    allocated_peer = (
+        parse_int(allocated[-1][1], "allocated peer slots") if allocated else None
+    )
 
     peaks: dict[int, int] = {}
     gpu_csv = run_dir / "gpu.csv"
@@ -119,9 +155,9 @@ def run_resources(run_dir: Path, log_text: str, meta: dict[str, str]) -> RunReso
     return RunResources(
         local_slots=local_slots,
         peer_slots=allocated_peer if allocated_peer is not None else (
-            int(peer.group(1)) if peer else None
+            parse_int(peer.group(1), "peer slots") if peer else None
         ),
-        peer_gib=float(peer.group(2)) if peer else None,
+        peer_gib=parse_float(peer.group(2), "peer cache GiB") if peer else None,
         gpu_peak_mib=peaks,
         disk_read_bytes=disk_bytes,
     )
@@ -135,7 +171,7 @@ def load(path: Path) -> Result:
     resources: list[RunResources] = []
     run_dirs = sorted(
         (p for p in path.glob("run-*") if p.is_dir()),
-        key=lambda p: int(p.name.split("-", 1)[1]),
+        key=run_index,
     )
     if not run_dirs:
         raise ValueError(f"no run-* directories under {path}")
@@ -156,15 +192,15 @@ def load(path: Path) -> Result:
             rows.append(
                 Row(
                     run=run_dir.name,
-                    ctx_tokens=int(v[0]),
-                    prefill_tokens=int(v[1]),
-                    prefill_tps=float(v[2]),
-                    gen_tokens=int(v[3]),
-                    gen_tps=float(v[4]),
-                    gen_first_ms=float(v[5]),
-                    gen_steady_tokens=int(v[6]),
-                    gen_steady_tps=float(v[7]),
-                    kvcache_bytes=int(v[8]),
+                    ctx_tokens=parse_int(v[0], f"{run_dir.name} context tokens"),
+                    prefill_tokens=parse_int(v[1], f"{run_dir.name} prefill tokens"),
+                    prefill_tps=parse_float(v[2], f"{run_dir.name} prefill throughput"),
+                    gen_tokens=parse_int(v[3], f"{run_dir.name} generated tokens"),
+                    gen_tps=parse_float(v[4], f"{run_dir.name} generation throughput"),
+                    gen_first_ms=parse_float(v[5], f"{run_dir.name} first-token latency"),
+                    gen_steady_tokens=parse_int(v[6], f"{run_dir.name} steady tokens"),
+                    gen_steady_tps=parse_float(v[7], f"{run_dir.name} steady throughput"),
+                    kvcache_bytes=parse_int(v[8], f"{run_dir.name} KV-cache bytes"),
                 )
             )
             found += 1
@@ -182,7 +218,15 @@ def load(path: Path) -> Result:
 
 
 def values(result: Result, ctx: int, field: str) -> list[float]:
-    return [float(getattr(row, field)) for row in result.rows if row.ctx_tokens == ctx]
+    output: list[float] = []
+    for row in result.rows:
+        if row.ctx_tokens != ctx:
+            continue
+        value = getattr(row, field)
+        if not isinstance(value, (int, float)):
+            raise ValueError(f"{result.label}: {field} is not numeric")
+        output.append(value * 1.0)
+    return output
 
 
 def med(result: Result, ctx: int, field: str) -> float:
@@ -192,17 +236,17 @@ def med(result: Result, ctx: int, field: str) -> float:
     return statistics.median(vals)
 
 
-def fmt_range(vals: list[float], decimals: int = 2) -> str:
+def fmt_range(vals: Sequence[int | float], decimals: int = 2) -> str:
     median = statistics.median(vals)
     if len(vals) == 1:
         return f"{median:.{decimals}f}"
     return f"{median:.{decimals}f} [{min(vals):.{decimals}f}..{max(vals):.{decimals}f}]"
 
 
-def fmt_optional_range(values: list[int | float], suffix: str = "") -> str:
+def fmt_optional_range(values: Sequence[int | float], suffix: str = "") -> str:
     if not values:
         return "n/a"
-    return f"{fmt_range([float(value) for value in values], 0)}{suffix}"
+    return f"{fmt_range(values, 0)}{suffix}"
 
 
 def describe(result: Result) -> None:
@@ -254,15 +298,15 @@ def compare(old: Result, new: Result) -> None:
     print("ctx  prefill_old  prefill_new  delta    gen_old  gen_new  delta    "
           "steady_old  steady_new  delta    first_ms_old  first_ms_new  delta")
     for ctx in common:
-        po, pn = med(old, ctx, "prefill_tps"), med(new, ctx, "prefill_tps")
+        po, prefill_new = med(old, ctx, "prefill_tps"), med(new, ctx, "prefill_tps")
         go, gn = med(old, ctx, "gen_tps"), med(new, ctx, "gen_tps")
         so, sn = med(old, ctx, "gen_steady_tps"), med(new, ctx, "gen_steady_tps")
-        fo, fn = med(old, ctx, "gen_first_ms"), med(new, ctx, "gen_first_ms")
+        first_old, fn = med(old, ctx, "gen_first_ms"), med(new, ctx, "gen_first_ms")
         print(
-            f"{ctx:<5} {po:>11.2f} {pn:>11.2f} {delta(po, pn):>8} "
+            f"{ctx:<5} {po:>11.2f} {prefill_new:>11.2f} {delta(po, prefill_new):>8} "
             f"{go:>8.2f} {gn:>8.2f} {delta(go, gn):>8} "
             f"{so:>11.2f} {sn:>11.2f} {delta(so, sn):>8} "
-            f"{fo:>12.1f} {fn:>12.1f} {delta(fo, fn):>8}"
+            f"{first_old:>12.1f} {fn:>12.1f} {delta(first_old, fn):>8}"
         )
 
 
