@@ -75,10 +75,14 @@ numerics-adjacent, so each goes through the VALIDATION.md §9 gate
   Run the A/B before committing to either.
 - [ ] **Reduce bytes per token.** The only attack on the 2.0 s read time.
   Two sub-levers:
-  - **Cache admission policy** — which experts earn the ~52 GB of combined
-    GPU-tier slots (currently fills naively from the miss stream).
-  - **Quantization choices** — smaller routed experts shrink the 7.1 GiB
-    per-token working set directly.
+  - [x] **Cache admission policy research gate** — closed 2026-07-11. A
+    context-2K/192-token passive-peer trace forced 1,608 exact-LRU evictions,
+    but every candidate tied or increased bytes; the best reduction was 0.00%,
+    versus the required 20%. Keep exact LRU.
+  - [ ] **Quantization choices** — smaller routed experts remain the available
+    byte lever. Replacing Q2_K down tensors with IQ2_XXS would theoretically
+    reduce routed payload 8.33% (72.562 -> 66.516 GiB), but the required HF
+    safetensors and imatrix are absent and current free disk is insufficient.
 - [ ] **Fast-path kernels (attacks the ~0.8 s compute slice).** flash / staged
   KV / batched attention / split-group8 decode / batched low-rank QK are still
   stubs routing to scalar equivalents (VOLTA.md:159). Routed-MoE measures

@@ -118,6 +118,24 @@ DS4_CUDA_EXPERT_TRACE_MAX_ROWS=1000000 \
   ./ds4 ... --cuda --ssd-streaming
 ```
 
+The benchmark harness can capture the same trace into each run directory for
+single-GPU or passive-peer experiments:
+
+```sh
+DS4_MODEL=/absolute/path/to/DeepSeek-V4-Flash.gguf \
+DS4_EXPERT_TRACE=1 DS4_EXPERT_TRACE_MAX_ROWS=2000000 \
+DS4_CTX_START=2048 DS4_CTX_MAX=2048 DS4_RUNS=1 DS4_WARMUPS=0 \
+  speed-bench/v100_bench.sh peer cache-policy-2k
+
+python3 speed-bench/expert-cache-sim.py \
+  speed-bench/local-runs/*-cache-policy-2k-peer/run-1/expert-trace.csv \
+  --decode-token-start 2048
+```
+
+Raw traces remain outside git under `speed-bench/local-runs/`. Distributed trace
+capture is rejected because coordinator and worker traces require separate model
+and cache accounting.
+
 The trace records router slots, logical token epoch, layer/expert, cache tier and
 owner, hit/miss, victim and age, uniquely accounted bytes read, batched I/O,
 classify/peer-copy, slot-upload and total stage timing, and cache geometry.
@@ -141,6 +159,12 @@ owner-balanced placement, decode-protected/prefill-ephemeral capacity, and
 optional top-K replication. Reuse-distance percentiles and optional per-layer
 reports are included. The final line states whether the best alternative passes
 the 20% runtime-policy gate.
+
+Tracked pressure-test summaries are in `v100_cache_policy.csv`. The
+context-2K/192-generated-token trace reached 1,608 exact-LRU evictions, but the
+best alternative still reduced bytes by 0.00%; other policies added 0.08–8.71%.
+This closes cache admission for the measured DeepSeek workload without adding a
+runtime policy.
 
 ## Peer-owner decode probe
 

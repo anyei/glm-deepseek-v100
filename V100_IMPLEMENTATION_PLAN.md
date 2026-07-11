@@ -347,6 +347,17 @@ policies and prefill used no global cache, so this workload has neither capacity
 pressure nor prefill pollution to fix. The required 20% runtime-policy gate
 fails decisively; do not add a runtime policy for this trace.
 
+Two larger context-2K traces closed the requested pressure follow-up on
+2026-07-11. At 96 generated tokens, exact LRU reproduced 45,118 hits, 23,560
+misses, and 166,755,041,280 bytes with no evictions; every useful alternative
+tied it. Extending the same prompt to 192 generated tokens forced 1,608 exact-LRU
+evictions and reproduced 92,819 hits, 25,439 misses, and 180,054,392,832 bytes.
+Decode protection and owner balancing still tied exact LRU, segmented LRU added
+0.13% bytes, top-K replication added 0.08%, per-layer quotas added 4.45%, and
+TinyLFU added 8.71%. The best reduction remained 0.00%, so demonstrated eviction
+pressure does not rescue the cache-policy path. Summaries are tracked in
+`speed-bench/v100_cache_policy.csv`; raw million-row traces remain outside git.
+
 Create `speed-bench/expert-cache-sim.py` consuming the Phase 2 trace. Simulate
 combined GPU capacities and report:
 
@@ -373,16 +384,21 @@ alternatives are trusted.
 ### 4.2 Select policy by bytes, not hit count alone
 
 **Decision: no runtime policy change for the measured DeepSeek workload.** The
-corrected representative peer trace predicts 0% byte reduction from the best
-alternative, far below the 20% gate; per-layer quotas are actively worse. Keep
-exact LRU and avoid adding policy metadata/CPU cost. Revisit only with a longer
-or materially different trace (larger context, another model, or demonstrated
-eviction pressure).
+context-256 trace and the context-2K/192-token pressure trace both predict 0%
+byte reduction from the best alternative, far below the 20% gate. The latter
+exercised 1,608 exact-LRU evictions, so lack of pressure is no longer a caveat.
+Keep exact LRU and avoid adding policy metadata/CPU cost. Revisit only for a
+materially different model or workload.
 
-Experts currently have uniform geometry within a model variant, but the design
-should calculate byte cost. Select the simplest policy achieving most of the
-simulated reduction. Reject policies whose metadata/decision cost approaches
-the expected savings.
+Experts currently have uniform geometry within this model variant. Metadata
+inspection shows 22.172 GiB each for IQ2_XXS gate and up tensors and 28.219 GiB
+for Q2_K down tensors. Making the down tensors IQ2_XXS would reduce routed expert
+payload from 72.562 to 66.516 GiB, an 8.33% theoretical byte reduction (about
+7.1 to 6.51 GiB for the cited per-token working set). The local quantizer needs
+the original HF safetensors and an importance matrix for a quality-gated build;
+neither is present, and only about 98 GiB of disk is free. Do not start a source
+model download or quantization build until storage and calibration assets are
+explicitly provisioned.
 
 **Gate to runtime implementation:** at least 20% simulated SSD-byte reduction
 on a representative decode trace or a clear prefill-pollution fix.

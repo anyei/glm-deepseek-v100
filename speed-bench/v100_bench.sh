@@ -31,6 +31,8 @@ Common overrides:
   DS4_ALLOW_BUSY=1              override the idle-host preflight
   DS4_HASH_MODEL=1              compute the large GGUF SHA-256 once
   DS4_MODEL_SHA256=<known-hash> record a known hash without rereading it
+  DS4_EXPERT_TRACE=1            write expert-trace.csv in each run directory
+  DS4_EXPERT_TRACE_MAX_ROWS=2000000
 
 Peer profile:
   DS4_PEER_CACHE_GB=26 DS4_PEER_DEVICE=1
@@ -85,6 +87,8 @@ dist_prefill_window=${DS4_DIST_PREFILL_WINDOW:-0}
 warm_weights=${DS4_WARM_WEIGHTS:-1}
 dry_run=${DS4_DRY_RUN:-0}
 hash_model=${DS4_HASH_MODEL:-0}
+expert_trace=${DS4_EXPERT_TRACE:-0}
+expert_trace_max_rows=${DS4_EXPERT_TRACE_MAX_ROWS:-2000000}
 min_cpu_idle=${DS4_MIN_CPU_IDLE_PCT:-80}
 max_idle_gpu_mib=${DS4_MAX_IDLE_GPU_MIB:-512}
 max_swap_io_mib=${DS4_MAX_SWAP_IO_MIB:-256}
@@ -102,13 +106,20 @@ for pair in "DS4_CTX_START:$ctx_start" "DS4_CTX_MAX:$ctx_max" \
             "DS4_MIN_CPU_IDLE_PCT:$min_cpu_idle" \
             "DS4_MAX_IDLE_GPU_MIB:$max_idle_gpu_mib" \
             "DS4_MAX_SWAP_IO_MIB:$max_swap_io_mib" \
-            "DS4_MAX_SWAP_IO_MIB_PER_SEC:$max_swap_io_mib_per_sec"; do
+            "DS4_MAX_SWAP_IO_MIB_PER_SEC:$max_swap_io_mib_per_sec" \
+            "DS4_EXPERT_TRACE:$expert_trace" \
+            "DS4_EXPERT_TRACE_MAX_ROWS:$expert_trace_max_rows"; do
     key=${pair%%:*}; value=${pair#*:}
     [[ "$value" =~ ^[0-9]+$ ]] || die "$key must be a non-negative integer"
 done
 (( runs > 0 )) || die "DS4_RUNS must be positive"
 (( ctx_start > 0 && ctx_max >= ctx_start && step_incr > 0 )) || die "invalid context range"
 (( min_cpu_idle <= 100 )) || die "DS4_MIN_CPU_IDLE_PCT must be <= 100"
+(( expert_trace == 0 || expert_trace == 1 )) || die "DS4_EXPERT_TRACE must be 0 or 1"
+(( expert_trace_max_rows > 0 )) || die "DS4_EXPERT_TRACE_MAX_ROWS must be positive"
+if (( expert_trace != 0 )) && [[ "$profile" == distributed ]]; then
+    die "DS4_EXPERT_TRACE currently supports only single and peer profiles"
+fi
 
 preflight_idle_host() {
     [[ "$dry_run" != 0 || "$allow_busy" != 0 ]] && return 0
@@ -183,6 +194,9 @@ container_common=(
     -v "$model_dir:/models:ro"
     -w /src
 )
+if (( expert_trace != 0 )); then
+    container_common+=( -v "$out:/output" )
+fi
 
 write_metadata() {
     local meta=$out/metadata.txt
@@ -205,6 +219,8 @@ write_metadata() {
             "$min_cpu_idle" "$max_idle_gpu_mib" "$max_swap_io_mib"
         printf 'max_swap_io_mib_per_sec=%s\nallow_busy=%s\n' \
             "$max_swap_io_mib_per_sec" "$allow_busy"
+        printf 'expert_trace=%s\nexpert_trace_max_rows=%s\n' \
+            "$expert_trace" "$expert_trace_max_rows"
         printf 'git_sha=%s\n' "$(git -C "$binary_dir" rev-parse HEAD 2>/dev/null || echo unknown)"
         printf 'git_status=%q\n' "$(git -C "$binary_dir" status --short 2>/dev/null || true)"
         printf 'ds4_sha256=%s\n' "$(sha256sum "$binary_dir/ds4" | awk '{print $1}')"
@@ -287,6 +303,13 @@ run_single_process() {
                -e DS4_CUDA_DEVICE=0
                -e "DS4_CUDA_PEER_DEVICE=${DS4_PEER_DEVICE:-1}"
                -e "DS4_CUDA_PEER_EXPERT_CACHE_GB=${DS4_PEER_CACHE_GB:-26}" )
+    fi
+    if (( expert_trace != 0 )); then
+        local trace_dir
+        trace_dir=$(basename "$dir")
+        cmd+=( -e "DS4_CUDA_EXPERT_TRACE=/output/$trace_dir/expert-trace.csv"
+               -e "DS4_CUDA_EXPERT_TRACE_MODEL_ID=$model_sha256"
+               -e "DS4_CUDA_EXPERT_TRACE_MAX_ROWS=$expert_trace_max_rows" )
     fi
     cmd+=( --entrypoint /src/ds4-bench "$image" "${common_bench[@]}" )
     quote_cmd "${cmd[@]}" >"$dir/command.sh"
